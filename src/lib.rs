@@ -380,6 +380,13 @@ fn var_info(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, decl: Va
             _ => ranges.push(r),
         }
     }
+    // A parameter is where the calling convention put it from the first instruction: Cranelift's range starts after the
+    // frame is set up, so a debugger stopped at the function's address would find it nowhere.
+    if decl.param {
+        if let Some(first) = ranges.first_mut() {
+            first.0 = 0;
+        }
+    }
     VarInfo { decl, ranges }
 }
 
