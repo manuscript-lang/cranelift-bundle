@@ -3,3 +3,7 @@ dist/
 vendor/
 smoke-test
 smoke-test.exe
+smoke-run
+smoke-run.exe
+smoke.o
+smoke.obj

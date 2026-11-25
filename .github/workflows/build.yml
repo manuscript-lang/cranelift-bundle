@@ -57,12 +57,15 @@ jobs:
           key: cargo-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'patches/*', 'cranelift-version') }}
       - name: Build
         run: sh build.sh "${{ matrix.os }}" "${{ matrix.arch }}" | tee dist-summary.txt
-      - name: Smoke test (load the library by path, compile a function, check the object)
+      - name: Smoke test (load the library by path, build functions with it, link and run them)
         run: |
           case "${{ matrix.os }}" in
-            linux)   cc smoke/smoke.c -ldl -o smoke-test && ./smoke-test target/release/libms_cranelift.so ;;
-            darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib ;;
-            windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll ;;
+            linux)   cc smoke/smoke.c -ldl -o smoke-test && ./smoke-test target/release/libms_cranelift.so smoke.o
+                     cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
+            darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib smoke.o
+                     cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
+            windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll smoke.obj
+                     clang smoke/main.c smoke.obj -o smoke-run.exe && ./smoke-run.exe ;;
           esac
       - run: cat dist-summary.txt
       - uses: actions/upload-artifact@v4
