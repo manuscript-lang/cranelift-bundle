@@ -1,0 +1,221 @@
+diff --git a/build.rs b/build.rs
+--- a/build.rs	2026-11-25 14:16:28.522484385 +0000
++++ b/build.rs	2026-11-25 14:16:28.565447867 +0000
+@@ -19,7 +19,6 @@
+ use meta::isle::IsleCompilation;
+ 
+ use std::env;
+-use std::io::Read;
+ use std::process;
+ use std::time::Instant;
+ 
+@@ -99,32 +98,11 @@
+         println!("cargo:warning=Generated files are in {}", out_dir.display());
+     }
+ 
+-    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap();
+-    let mut cmd = std::process::Command::new("git");
+-    cmd.arg("rev-parse")
+-        .arg("HEAD")
+-        .stdout(std::process::Stdio::piped())
+-        .current_dir(env::var("CARGO_MANIFEST_DIR").unwrap());
+-    let version = if let Ok(mut child) = cmd.spawn() {
+-        let mut git_rev = String::new();
+-        child
+-            .stdout
+-            .as_mut()
+-            .unwrap()
+-            .read_to_string(&mut git_rev)
+-            .unwrap();
+-        let status = child.wait().unwrap();
+-        if status.success() {
+-            let git_rev = git_rev.trim().chars().take(9).collect::<String>();
+-            format!("{pkg_version}-{git_rev}")
+-        } else {
+-            // not a git repo
+-            pkg_version
+-        }
+-    } else {
+-        // git not available
+-        pkg_version
+-    };
++    // Manuscript: the published crate appends the git revision of the checkout that holds it. This copy
++    // lives inside the Manuscript repository, so that was the revision of every Manuscript commit, which
++    // gave each commit a different `VERSION` and so a different sccache key: CI recompiled the whole crate
++    // (85 s, a 110 MB cache entry) on every run. See PATCH.md.
++    let version = env::var("CARGO_PKG_VERSION").unwrap();
+     std::fs::write(
+         std::path::Path::new(&out_dir).join("version.rs"),
+         format!(
+diff --git a/src/isa/x64/inst.isle b/src/isa/x64/inst.isle
+--- a/src/isa/x64/inst.isle	2026-11-25 14:16:28.556039287 +0000
++++ b/src/isa/x64/inst.isle	2026-11-25 14:16:28.910578153 +0000
+@@ -3881,11 +3881,50 @@
+       (is_nonzero
+        (is_second_result uadd @ (uadd_overflow (fits_in_64 ty) x y)))
+       (if-let (first_result sum_value) uadd)
+-      (let ((producer ProducesFlags (x64_add_with_flags_paired ty x y)))
++      (let ((producer ProducesFlags (x64_add_with_flags_paired ty x (gpr_or_simm32 y))))
+         (CondResult.CC
+          (produces_flags_opportunistic_def producer sum_value)
+          (CC.B))))
+ 
++;; The second operand of a fused overflow check: an immediate or a register, never a
++;; memory operand. The instruction that produced the flags is still lowered on its own
++;; when its result has other uses, and a load cannot be folded into both.
++(decl gpr_no_load (Value) GprMem)
++(rule (gpr_no_load val) (gpr_to_gpr_mem (put_in_gpr val)))
++
++(decl gpr_or_simm32 (Value) GprMemImm)
++(rule 1 (gpr_or_simm32 (simm32_from_value imm)) imm)
++(rule 0 (gpr_or_simm32 val) (gpr_to_gpr_mem_imm (put_in_gpr val)))
++
++;; The same for the signed and subtracting forms: `add`/`sub` set OF (signed) and CF
++;; (unsigned borrow) themselves, so a `brif` on the flag needs no `seto`/`setb`.
++(rule 8
++      (is_nonzero
++       (is_second_result sadd @ (sadd_overflow (fits_in_64 ty) x y)))
++      (if-let (first_result sum_value) sadd)
++      (let ((producer ProducesFlags (x64_add_with_flags_paired ty x (gpr_or_simm32 y))))
++        (CondResult.CC
++         (produces_flags_opportunistic_def producer sum_value)
++         (CC.O))))
++
++(rule 9
++      (is_nonzero
++       (is_second_result ssub @ (ssub_overflow (fits_in_64 ty) x y)))
++      (if-let (first_result diff_value) ssub)
++      (let ((producer ProducesFlags (x64_sub_with_flags_paired ty x (gpr_or_simm32 y))))
++        (CondResult.CC
++         (produces_flags_opportunistic_def producer diff_value)
++         (CC.O))))
++
++(rule 10
++      (is_nonzero
++       (is_second_result usub @ (usub_overflow (fits_in_64 ty) x y)))
++      (if-let (first_result diff_value) usub)
++      (let ((producer ProducesFlags (x64_sub_with_flags_paired ty x (gpr_or_simm32 y))))
++        (CondResult.CC
++         (produces_flags_opportunistic_def producer diff_value)
++         (CC.B))))
++
+ ;; Using the flags output of `umul_overflow`/`smul_overflow` can produce a
+ ;; `CC` and give an opportunistic def of the other output. The multiply
+ ;; itself sets the overflow flag (OF for `imul`; OF==CF for the unsigned
+@@ -3894,7 +3933,7 @@
+       (is_nonzero
+        (is_second_result umul @ (umul_overflow _ x y @ (value_type (ty_int_ref_16_to_64 ty)))))
+       (if-let (first_result prod_value) umul)
+-      (let ((producer ProducesFlags (x64_mul_lo_with_flags_paired ty false x y)))
++      (let ((producer ProducesFlags (x64_mul_lo_with_flags_paired ty false x (gpr_no_load y))))
+         (CondResult.CC
+          (produces_flags_opportunistic_def producer prod_value)
+          (CC.O))))
+@@ -3903,7 +3942,7 @@
+       (is_nonzero
+        (is_second_result umul @ (umul_overflow _ x y @ (value_type $I8))))
+       (if-let (first_result prod_value) umul)
+-      (let ((producer ProducesFlags (x64_mul8_with_flags_paired false x y)))
++      (let ((producer ProducesFlags (x64_mul8_with_flags_paired false x (gpr_no_load y))))
+         (CondResult.CC
+          (produces_flags_opportunistic_def producer prod_value)
+          (CC.O))))
+@@ -3912,7 +3951,7 @@
+       (is_nonzero
+        (is_second_result smul @ (smul_overflow _ x y @ (value_type (ty_int_ref_16_to_64 ty)))))
+       (if-let (first_result prod_value) smul)
+-      (let ((producer ProducesFlags (x64_mul_lo_with_flags_paired ty true x y)))
++      (let ((producer ProducesFlags (x64_mul_lo_with_flags_paired ty true x (gpr_no_load y))))
+         (CondResult.CC
+          (produces_flags_opportunistic_def producer prod_value)
+          (CC.O))))
+@@ -3921,7 +3960,7 @@
+       (is_nonzero
+        (is_second_result smul @ (smul_overflow _ x y @ (value_type $I8))))
+       (if-let (first_result prod_value) smul)
+-      (let ((producer ProducesFlags (x64_mul8_with_flags_paired true x y)))
++      (let ((producer ProducesFlags (x64_mul8_with_flags_paired true x (gpr_no_load y))))
+         (CondResult.CC
+          (produces_flags_opportunistic_def producer prod_value)
+          (CC.O))))
+diff --git a/src/isa/x64/lower.isle b/src/isa/x64/lower.isle
+--- a/src/isa/x64/lower.isle	2026-11-25 14:16:28.556600947 +0000
++++ b/src/isa/x64/lower.isle	2026-11-25 14:16:28.912680326 +0000
+@@ -184,7 +184,7 @@
+ (rule 3 (lower i @ (uadd_overflow (fits_in_64 ty) x y))
+         (if-let (second_result flags) i)
+         (if-let false (value_used flags))
+-        (output_pair (value_reg (x64_add ty x y)) (value_regs_invalid)))
++        (output_pair (value_reg (x64_add ty x (gpr_or_simm32 y))) (value_regs_invalid)))
+ 
+ (rule 1 (lower (uadd_overflow _ x y @ (value_type (fits_in_64 ty))))
+       (construct_overflow_op_alu ty (CC.B) (ProduceFlagsOp.Add) x y))
+@@ -195,6 +195,12 @@
+ 
+ ;;;; Rules for `sadd_overflow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ 
++;; As for `uadd_overflow`: a flags output consumed only by a `brif` needs no `seto`.
++(rule 3 (lower i @ (sadd_overflow (fits_in_64 ty) x y))
++        (if-let (second_result flags) i)
++        (if-let false (value_used flags))
++        (output_pair (value_reg (x64_add ty x (gpr_or_simm32 y))) (value_regs_invalid)))
++
+ (rule 1 (lower (sadd_overflow _ x y @ (value_type (fits_in_64 ty))))
+       (construct_overflow_op_alu ty (CC.O) (ProduceFlagsOp.Add) x y))
+ 
+@@ -203,6 +209,12 @@
+ 
+ ;;;; Rules for `usub_overflow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ 
++;; As for `uadd_overflow`: a flags output consumed only by a `brif` needs no `setb`.
++(rule 3 (lower i @ (usub_overflow (fits_in_64 ty) x y))
++        (if-let (second_result flags) i)
++        (if-let false (value_used flags))
++        (output_pair (value_reg (x64_sub ty x (gpr_or_simm32 y))) (value_regs_invalid)))
++
+ (rule 1 (lower (usub_overflow _ x y @ (value_type (fits_in_64 ty))))
+       (construct_overflow_op_alu ty (CC.B) (ProduceFlagsOp.Sub) x y))
+ 
+@@ -211,6 +223,12 @@
+ 
+ ;;;; Rules for `ssub_overflow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ 
++;; As for `uadd_overflow`: a flags output consumed only by a `brif` needs no `seto`.
++(rule 3 (lower i @ (ssub_overflow (fits_in_64 ty) x y))
++        (if-let (second_result flags) i)
++        (if-let false (value_used flags))
++        (output_pair (value_reg (x64_sub ty x (gpr_or_simm32 y))) (value_regs_invalid)))
++
+ (rule 1 (lower (ssub_overflow _ x y @ (value_type (fits_in_64 ty))))
+       (construct_overflow_op_alu ty (CC.O) (ProduceFlagsOp.Sub) x y))
+ 
+@@ -226,12 +244,12 @@
+ (rule 4 (lower i @ (umul_overflow _ x y @ (value_type (ty_int_ref_16_to_64 ty))))
+         (if-let (second_result flags) i)
+         (if-let false (value_used flags))
+-        (output_pair (x64_mul ty false x y) (value_regs_invalid)))
++        (output_pair (x64_mul ty false x (gpr_no_load y)) (value_regs_invalid)))
+ 
+ (rule 5 (lower i @ (umul_overflow _ x y @ (value_type $I8)))
+         (if-let (second_result flags) i)
+         (if-let false (value_used flags))
+-        (output_pair (value_reg (x64_mul8 false x y)) (value_regs_invalid)))
++        (output_pair (value_reg (x64_mul8 false x (gpr_no_load y))) (value_regs_invalid)))
+ 
+ (rule 2 (lower (umul_overflow _ x y @ (value_type $I8)))
+       (construct_overflow_op (CC.O) (x64_mul8_with_flags_paired false x y)))
+@@ -246,12 +264,12 @@
+ (rule 4 (lower i @ (smul_overflow _ x y @ (value_type (ty_int_ref_16_to_64 ty))))
+         (if-let (second_result flags) i)
+         (if-let false (value_used flags))
+-        (output_pair (x64_mul ty true x y) (value_regs_invalid)))
++        (output_pair (x64_mul ty true x (gpr_no_load y)) (value_regs_invalid)))
+ 
+ (rule 5 (lower i @ (smul_overflow _ x y @ (value_type $I8)))
+         (if-let (second_result flags) i)
+         (if-let false (value_used flags))
+-        (output_pair (value_reg (x64_mul8 true x y)) (value_regs_invalid)))
++        (output_pair (value_reg (x64_mul8 true x (gpr_no_load y))) (value_regs_invalid)))
+ 
+ (rule 2 (lower (smul_overflow _ x y @ (value_type $I8)))
+       (construct_overflow_op (CC.O) (x64_mul8_with_flags_paired true x y)))

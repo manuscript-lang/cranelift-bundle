@@ -1,0 +1,29 @@
+[package]
+name = "ms_cranelift"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# One instruction set per platform: build.sh passes x86 on amd64 and arm64 on arm64.
+x86 = ["cranelift-codegen/x86"]
+arm64 = ["cranelift-codegen/arm64"]
+
+[dependencies]
+cranelift-codegen = { version = "=0.136.0", default-features = false, features = ["std"] }
+cranelift-frontend = "=0.136.0"
+cranelift-module = "=0.136.0"
+cranelift-object = "=0.136.0"
+target-lexicon = "0.13"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
