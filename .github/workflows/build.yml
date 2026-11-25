@@ -60,8 +60,9 @@ jobs:
       - name: Smoke test (load the library by path, build functions with it, link and run them)
         run: |
           case "${{ matrix.os }}" in
-            linux)   cc smoke/smoke.c -ldl -o smoke-test && ./smoke-test target/release/libms_cranelift.so smoke.o
-                     cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
+            linux)   cc smoke/smoke.c -ldl -lpthread -o smoke-test && ./smoke-test target/release/libms_cranelift.so smoke.o
+                     cc smoke/main.c smoke.o -o smoke-run && ./smoke-run
+                     readelf --debug-dump=decodedline smoke.o | grep -q 'smoke.ms *42' ;;
             darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib smoke.o
                      cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
             windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll smoke.obj

@@ -2,8 +2,9 @@
 #include <stdint.h>
 #include <stdio.h>
 extern int64_t ms_add(int64_t, int64_t), ms_sum(int64_t), ms_checked(int64_t, int64_t), ms_float(double),
-    ms_mem(int64_t), ms_indirect(int64_t, int64_t);
+    ms_mem(int64_t), ms_indirect(int64_t, int64_t), pf_0(int64_t), pf_5(int64_t), pf_17(int64_t), pf_63(int64_t);
 extern int64_t ms_counter;
+extern const uintptr_t ms_pcs[3];
 static int bad;
 #define EXPECT(e, want) do { int64_t g = (e); if (g != (want)) { printf("FAIL %s = %lld, want %lld\n", #e, (long long)g, (long long)(want)); bad = 1; } } while (0)
 int main(void) {
@@ -18,6 +19,13 @@ int main(void) {
   EXPECT(ms_mem(2), 255 + 2 - 1 + 10 + 1000);
   EXPECT(ms_counter, 15);
   EXPECT(ms_indirect(20, 22), 42);
+  EXPECT(pf_0(7), 7);
+  EXPECT(pf_5(10), 15);
+  EXPECT(pf_17(100), 117);
+  EXPECT(pf_63(1), 64);
+  EXPECT(ms_pcs[0], (int64_t)((uintptr_t)&ms_add + 4));   /* a function address plus an offset */
+  EXPECT(ms_pcs[1], (int64_t)(uintptr_t)&ms_sum);
+  EXPECT(ms_pcs[2], (int64_t)((uintptr_t)&ms_pcs + 8));    /* the table points into itself */
   puts(bad ? "FAILED" : "all ok");
   return bad;
 }

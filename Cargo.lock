@@ -281,6 +281,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-module",
  "cranelift-object",
+ "gimli",
  "target-lexicon",
 ]
 
