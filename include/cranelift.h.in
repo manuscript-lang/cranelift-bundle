@@ -1,0 +1,148 @@
+/* A C interface to Cranelift: build functions and data, get one relocatable object.
+ *
+ * A module (cl) holds declarations and data and writes the object; function builders (cl_fn) build and compile
+ * functions, in parallel if you like. Handles (values, blocks, stack slots, signatures, functions, data) are distinct struct types, so mixing them up
+ * is a compile error. Values, blocks and slots belong to the function being built (between cl_fn_begin and
+ * cl_fn_end); signatures, functions and data belong to the module. A bad handle aborts the process (the caller is
+ * a compiler); a failure that depends on the input returns nonzero or null and sets cl_error.
+ *
+ * Two ways to use it, with identical code:
+ *   - Link against the library: include this header.
+ *   - Load it at run time: define CL_DYNAMIC, include this header in every file, define CL_DEFINE_API in exactly
+ *     one of them, and call cl_bind(resolver, data) once. The resolver maps a symbol name to its address
+ *     (dlsym or GetProcAddress on the library handle); cl_bind returns the first missing name, or NULL.
+ *
+ * Sketch (a function i64 add(i64, i64)):
+ *   cl *c = cl_new(NULL, 0, NULL, NULL);
+ *   cl_sig s = cl_sig_new(c);
+ *   cl_sig_param(c, s, CL_I64, CL_EXT_NONE); cl_sig_param(c, s, CL_I64, CL_EXT_NONE);
+ *   cl_sig_ret(c, s, CL_I64, CL_EXT_NONE);
+ *   cl_func f = cl_declare_func(c, "add", s, CL_EXPORT);
+ *   cl_fn *b = cl_fn_new(c);                 // one builder per thread that builds
+ *   cl_fn_begin(b, f);
+ *   cl_block blk = cl_entry(b);
+ *   cl_ret1(b, cl_iadd(b, cl_block_param(b, blk, 0), cl_block_param(b, blk, 1)));
+ *   cl_seal_all(b);
+ *   cl_fn_end(b);   // queued for the worker threads; cl_finish waits
+ *   size_t n; const uint8_t *object = cl_finish(c, &n);   // valid until cl_free
+ */
+#ifndef CRANELIFT_H
+#define CRANELIFT_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct cl cl;       /* a module */
+typedef struct cl_fn cl_fn; /* a function builder */
+typedef struct { uint32_t id; } cl_val;
+typedef struct { uint32_t id; } cl_block;
+typedef struct { uint32_t id; } cl_slot;
+typedef struct { uint32_t id; } cl_sig;
+typedef struct { uint32_t id; } cl_func;
+typedef struct { uint32_t id; } cl_data;
+/* A checked operation's result and its overflow flag (an i8). */
+typedef struct { cl_val result, flag; } cl_ovf_result;
+
+typedef enum { CL_I8, CL_I16, CL_I32, CL_I64, CL_F32, CL_F64 } cl_type;
+/* How a signature extends a narrow argument or result to a full register. */
+typedef enum { CL_EXT_NONE, CL_EXT_U, CL_EXT_S } cl_ext;
+typedef enum { CL_IMPORT, CL_EXPORT, CL_LOCAL, CL_PREEMPTIBLE } cl_linkage;
+/* Memory flags, or-ed. CL_NOTRAP_ALIGNED: it cannot trap and is aligned. */
+typedef enum { CL_NOTRAP = 1, CL_ALIGNED = 2, CL_READONLY = 4, CL_CAN_MOVE = 8,
+               CL_NOTRAP_ALIGNED = 3 } cl_mem;
+
+typedef enum { CL_INEG, CL_BNOT, CL_CLZ, CL_CTZ, CL_POPCNT, CL_BSWAP, CL_BITREV, CL_IABS,
+               CL_FNEG, CL_FABS, CL_SQRT, CL_CEIL, CL_FLOOR, CL_TRUNC, CL_NEAREST } cl_unop;
+typedef enum { CL_IADD, CL_ISUB, CL_IMUL, CL_SDIV, CL_UDIV, CL_SREM, CL_UREM, CL_BAND,
+               CL_BOR, CL_BXOR, CL_ISHL, CL_SSHR, CL_USHR, CL_ROTL, CL_ROTR, CL_UMULHI,
+               CL_SMULHI, CL_FADD, CL_FSUB, CL_FMUL, CL_FDIV, CL_FMIN, CL_FMAX,
+               CL_FCOPYSIGN, CL_SMIN, CL_SMAX, CL_UMIN, CL_UMAX, CL_BAND_NOT, CL_BOR_NOT,
+               CL_BXOR_NOT } cl_binop;
+typedef enum { CL_SADD_OVF, CL_UADD_OVF, CL_SSUB_OVF, CL_USUB_OVF, CL_SMUL_OVF,
+               CL_UMUL_OVF } cl_ovfop;
+typedef enum { CL_UEXTEND, CL_SEXTEND, CL_IREDUCE, CL_FPROMOTE, CL_FDEMOTE, CL_FCVT_FROM_SINT,
+               CL_FCVT_FROM_UINT, CL_FCVT_TO_SINT, CL_FCVT_TO_UINT, CL_FCVT_TO_SINT_SAT,
+               CL_FCVT_TO_UINT_SAT, CL_BITCAST } cl_castop;
+typedef enum { CL_EQ, CL_NE, CL_SLT, CL_SGE, CL_SGT, CL_SLE, CL_ULT, CL_UGE, CL_UGT,
+               CL_ULE } cl_icmp_cc;
+typedef enum { CL_FEQ, CL_FNE, CL_FLT, CL_FLE, CL_FGT, CL_FGE, CL_FORD, CL_FUNO,
+               CL_FUEQ, CL_FONE, CL_FULT, CL_FULE, CL_FUGT, CL_FUGE } cl_fcmp_cc;
+typedef enum { CL_RMW_ADD, CL_RMW_SUB, CL_RMW_AND, CL_RMW_NAND, CL_RMW_OR, CL_RMW_XOR,
+               CL_RMW_XCHG, CL_RMW_UMIN, CL_RMW_UMAX, CL_RMW_SMIN, CL_RMW_SMAX } cl_rmwop;
+
+/* A machine-code range of a function, as offsets from its start, with the place given to cl_srcloc (file is
+ * UINT32_MAX for code that had none). */
+typedef struct { uint32_t off, end, file, line, column; } cl_code_range;
+/* Store the address of a function (kind 0) or data object (kind 1) plus addend at offset. */
+typedef struct { uint32_t offset, kind, target; int64_t addend; } cl_reloc;
+
+@API@
+
+#ifdef CL_DYNAMIC
+typedef struct {
+#define CL_MEMBER(ret, name, args) ret(*fn_##name) args;
+  CL_API(CL_MEMBER)
+#undef CL_MEMBER
+} cl_api;
+extern cl_api cl_fns;
+@ALIASES@
+
+typedef void *(*cl_resolver)(void *data, const char *name);
+/* Fills the table; returns the first name the resolver could not find, or NULL. */
+static inline const char *cl_bind(cl_resolver resolve, void *data) {
+#define CL_BIND(ret, name, args) \
+  if (!(cl_fns.fn_##name = (ret(*) args)resolve(data, #name))) return #name;
+  CL_API(CL_BIND)
+#undef CL_BIND
+  return NULL;
+}
+#ifdef CL_DEFINE_API
+cl_api cl_fns;
+#endif
+#else
+#define CL_PROTO(ret, name, args) ret name args;
+CL_API(CL_PROTO)
+#undef CL_PROTO
+#endif
+
+/* Conveniences over the generic functions. */
+#define CL_UNOP(fn, op) static inline cl_val cl_##fn(cl_fn *c, cl_val x) { return cl_unary(c, op, x); }
+#define CL_BINOP(fn, op) \
+  static inline cl_val cl_##fn(cl_fn *c, cl_val x, cl_val y) { return cl_binary(c, op, x, y); }
+CL_UNOP(ineg, CL_INEG) CL_UNOP(bnot, CL_BNOT) CL_UNOP(clz, CL_CLZ) CL_UNOP(ctz, CL_CTZ)
+CL_UNOP(popcnt, CL_POPCNT) CL_UNOP(fneg, CL_FNEG) CL_UNOP(fabs, CL_FABS) CL_UNOP(sqrt, CL_SQRT)
+CL_UNOP(ceil, CL_CEIL) CL_UNOP(floor, CL_FLOOR) CL_UNOP(trunc, CL_TRUNC)
+CL_UNOP(nearest, CL_NEAREST)
+CL_BINOP(iadd, CL_IADD) CL_BINOP(isub, CL_ISUB) CL_BINOP(imul, CL_IMUL) CL_BINOP(sdiv, CL_SDIV)
+CL_BINOP(udiv, CL_UDIV) CL_BINOP(srem, CL_SREM) CL_BINOP(urem, CL_UREM) CL_BINOP(band, CL_BAND)
+CL_BINOP(bor, CL_BOR) CL_BINOP(bxor, CL_BXOR) CL_BINOP(ishl, CL_ISHL) CL_BINOP(sshr, CL_SSHR)
+CL_BINOP(ushr, CL_USHR) CL_BINOP(rotl, CL_ROTL) CL_BINOP(rotr, CL_ROTR)
+CL_BINOP(umulhi, CL_UMULHI) CL_BINOP(fadd, CL_FADD) CL_BINOP(fsub, CL_FSUB)
+CL_BINOP(fmul, CL_FMUL) CL_BINOP(fdiv, CL_FDIV)
+#undef CL_UNOP
+#undef CL_BINOP
+
+static inline cl_val cl_i64const(cl_fn *c, int64_t k) { return cl_iconst(c, CL_I64, k); }
+static inline void cl_ret1(cl_fn *c, cl_val v) { cl_ret(c, &v, 1); }
+static inline void cl_ret0(cl_fn *c) { cl_ret(c, NULL, 0); }
+static inline void cl_jump0(cl_fn *c, cl_block to) { cl_jump(c, to, NULL, 0); }
+static inline void cl_br(cl_fn *c, cl_val cond, cl_block then, cl_block els) {
+  cl_brif(c, cond, then, NULL, 0, els, NULL, 0);
+}
+/* A call with exactly one result. */
+static inline cl_val cl_call1(cl_fn *c, cl_func f, const cl_val *args, uint32_t n) {
+  cl_val r;
+  cl_call(c, f, args, n, &r);
+  return r;
+}
+static inline cl_val cl_call_indirect1(cl_fn *c, cl_sig s, cl_val callee, const cl_val *args, uint32_t n) {
+  cl_val r;
+  cl_call_indirect(c, s, callee, args, n, &r);
+  return r;
+}
+#ifdef __cplusplus
+}
+#endif
+#endif

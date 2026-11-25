@@ -1,14 +1,14 @@
-//! A C ABI over Cranelift: everything the Manuscript MIR lowering needs to build functions and data,
-//! and write one relocatable object with line-table DWARF. See `include/ms_cranelift.h`, which this file must match.
+//! A C ABI over Cranelift: everything a compiler back end needs to build functions and data,
+//! and write one relocatable object with line-table DWARF. See `include/cranelift.h`, which this file must match.
 //!
 //! Two kinds of object: a module (`Cl`: signatures, function and data declarations, data, the finished object)
 //! and a function builder (`Fnb`: one function's blocks, values and compile). Builders do not touch the module while
 //! they build or compile, so several threads can each own a builder, compile in parallel, and hand the results to the
-//! module (`ms_cl_define`) one at a time. Declarations must exist before a body mentions them.
+//! module (`cl_define`) one at a time. Declarations must exist before a body mentions them.
 //!
 //! The functions never unwind across the boundary (`panic = "abort"`). A bad handle aborts the process: the caller is a
 //! compiler, not an untrusted client. Failures that depend on the input (the verifier, an unknown setting) are reported
-//! through `ms_cl_error` and `ms_cl_fn_error`.
+//! through `cl_error` and `cl_fn_error`.
 
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -53,7 +53,7 @@ pub struct Ovf {
 }
 
 /// One range of a function's code and the source place of its instructions: `off..end` are offsets from the function's
-/// start, the rest is what `ms_cl_srcloc` was given (file `u32::MAX` when none was).
+/// start, the rest is what `cl_srcloc` was given (file `u32::MAX` when none was).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ClCodeRange {
@@ -61,7 +61,7 @@ pub struct ClCodeRange {
     pub end: u32,
     pub file: u32,
     pub line: u32,
-    pub scope: u32,
+    pub column: u32,
 }
 
 /// A pointer-sized relocation in a data object: at `offset` store the address of function or data `target` plus
@@ -87,7 +87,7 @@ struct DataDecl {
     tls: bool,
 }
 
-/// What builders read from the module: written by the module's declare calls, read by `ms_cl_call` and friends.
+/// What builders read from the module: written by the module's declare calls, read by `cl_call` and friends.
 #[derive(Default)]
 struct Decls {
     sigs: Vec<Signature>,
@@ -108,7 +108,7 @@ struct FuncInfo {
 }
 
 /// A function address plus `addend` in a data object, written after `finish` (Cranelift's data relocations carry no
-/// addend for functions, and the fault tables point into the middle of functions).
+/// addend for functions, and a table of code addresses may point into the middle of functions).
 struct LateReloc {
     data: u32,
     offset: u32,
@@ -143,7 +143,7 @@ pub struct Fnb {
     frefs: HashMap<u32, FuncRef>,
     grefs: HashMap<u32, GlobalValue>,
     srefs: HashMap<u32, SigRef>,
-    /// The (file, line, scope) of each `ms_cl_srcloc` call; a `SourceLoc` is an index into it.
+    /// The (file, line, column) of each `cl_srcloc` call; a `SourceLoc` is an index into it.
     locs: Vec<(u32, u32, u32)>,
     loc_ix: HashMap<(u32, u32, u32), u32>,
     err: CString,
@@ -172,7 +172,7 @@ struct Run {
     /// The queue and the workers, started by the first job.
     pool: Mutex<Pool>,
     info: Mutex<Vec<FuncInfo>>,
-    /// Compiled functions waiting for `ms_cl_finish`, which defines them in declaration order so the object does not
+    /// Compiled functions waiting for `cl_finish`, which defines them in declaration order so the object does not
     /// depend on which worker finished first.
     done: Mutex<Vec<Option<Compiled>>>,
     errors: Mutex<Vec<(u32, String)>>,
@@ -282,8 +282,8 @@ fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32
     let size = cc.code_buffer().len() as u32;
     let mut ranges = Vec::new();
     for r in cc.buffer.get_srclocs_sorted() {
-        let (file, line, scope) = locs.get(r.loc.bits() as usize).copied().unwrap_or((u32::MAX, 0, 0));
-        ranges.push(ClCodeRange { off: r.start, end: r.end.min(size), file, line, scope });
+        let (file, line, column) = locs.get(r.loc.bits() as usize).copied().unwrap_or((u32::MAX, 0, 0));
+        ranges.push(ClCodeRange { off: r.start, end: r.end.min(size), file, line, column });
     }
     let relocs = cc.buffer.relocs().iter().map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id)).collect();
     Ok((Compiled { code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs }, ranges))
@@ -298,7 +298,7 @@ fn fb<'a>(f: *mut Fnb) -> &'a mut Fnb {
 }
 
 fn bld(c: &mut Fnb) -> &mut FunctionBuilder<'static> {
-    c.builder.as_mut().expect("ms_cl_fn_begin was not called")
+    c.builder.as_mut().expect("cl_fn_begin was not called")
 }
 
 fn module(c: &mut Cl) -> &mut ObjectModule {
@@ -389,9 +389,9 @@ thread_local! {
 
 /// Creates a module for `triple` (null: the host). `keys[i]`/`vals[i]` are Cranelift settings that override the
 /// defaults (for example `opt_level` = `speed`, `regalloc_algorithm` = `single_pass`). Returns null and sets the
-/// error (read with `ms_cl_error(null)`) when the target or a setting is unknown.
+/// error (read with `cl_error(null)`) when the target or a setting is unknown.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_new(triple: *const c_char, n: u32, keys: *const *const c_char, vals: *const *const c_char) -> *mut Cl {
+pub unsafe extern "C" fn cl_new(triple: *const c_char, n: u32, keys: *const *const c_char, vals: *const *const c_char) -> *mut Cl {
     let r = (|| -> Result<Cl, String> {
         let triple = if triple.is_null() {
             target_lexicon::Triple::host()
@@ -410,12 +410,12 @@ pub unsafe extern "C" fn ms_cl_new(triple: *const c_char, n: u32, keys: *const *
         set("enable_multi_ret_implicit_sret", "true")?;
         set("enable_probestack", "true")?;
         set("probestack_strategy", "inline")?;
-        // `ms_threads` is ours, not Cranelift's: how many workers compile functions (default: one per core).
+        // `threads` is ours, not Cranelift's: how many workers compile functions (default: one per core).
         let mut threads = thread::available_parallelism().map_or(1, |n| n.get());
         for i in 0..n as usize {
             let (k, v) = (cstr(*keys.add(i)), cstr(*vals.add(i)));
-            if k == "ms_threads" {
-                threads = v.parse().map_err(|_| format!("ms_threads={v}: not a number"))?;
+            if k == "threads" {
+                threads = v.parse().map_err(|_| format!("threads={v}: not a number"))?;
             } else {
                 set(k, v)?;
             }
@@ -456,9 +456,9 @@ pub unsafe extern "C" fn ms_cl_new(triple: *const c_char, n: u32, keys: *const *
     }
 }
 
-/// The last error of `c`, or of `ms_cl_new` when `c` is null. Valid until the next call on `c`.
+/// The last error of `c`, or of `cl_new` when `c` is null. Valid until the next call on `c`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_error(c: *mut Cl) -> *const c_char {
+pub unsafe extern "C" fn cl_error(c: *mut Cl) -> *const c_char {
     if c.is_null() {
         LAST_ERROR.with(|l| l.borrow().as_ptr())
     } else {
@@ -467,7 +467,7 @@ pub unsafe extern "C" fn ms_cl_error(c: *mut Cl) -> *const c_char {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_free(c: *mut Cl) {
+pub unsafe extern "C" fn cl_free(c: *mut Cl) {
     if !c.is_null() {
         drop(Box::from_raw(c));
     }
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn ms_cl_free(c: *mut Cl) {
 
 /// Starts a signature. The calling convention is the target's C one.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_sig_new(c: *mut Cl) -> SigId {
+pub unsafe extern "C" fn cl_sig_new(c: *mut Cl) -> SigId {
     let c = cl(c);
     let cc = c.isa.default_call_conv();
     let mut d = c.decls.write().unwrap();
@@ -485,18 +485,18 @@ pub unsafe extern "C" fn ms_cl_sig_new(c: *mut Cl) -> SigId {
 
 /// Adds a parameter (`ext` 0 none, 1 zero-extend, 2 sign-extend to a full register).
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_sig_param(c: *mut Cl, sig: SigId, t: u32, ext: u32) {
+pub unsafe extern "C" fn cl_sig_param(c: *mut Cl, sig: SigId, t: u32, ext: u32) {
     cl(c).decls.write().unwrap().sigs[sig.0 as usize].params.push(abi(t, ext));
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_sig_ret(c: *mut Cl, sig: SigId, t: u32, ext: u32) {
+pub unsafe extern "C" fn cl_sig_ret(c: *mut Cl, sig: SigId, t: u32, ext: u32) {
     cl(c).decls.write().unwrap().sigs[sig.0 as usize].returns.push(abi(t, ext));
 }
 
 /// Declares a function; `link` 0 import, 1 export, 2 local (hidden), 3 preemptible.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_declare_func(c: *mut Cl, name: *const c_char, sig: SigId, link: u32) -> Func {
+pub unsafe extern "C" fn cl_declare_func(c: *mut Cl, name: *const c_char, sig: SigId, link: u32) -> Func {
     let c = cl(c);
     let s = c.decls.read().unwrap().sigs[sig.0 as usize].clone();
     let l = linkage(link);
@@ -510,7 +510,7 @@ pub unsafe extern "C" fn ms_cl_declare_func(c: *mut Cl, name: *const c_char, sig
 
 /// Declares a data object (`tls` makes it thread-local).
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_declare_data(c: *mut Cl, name: *const c_char, link: u32, writable: i32, tls: i32) -> Data {
+pub unsafe extern "C" fn cl_declare_data(c: *mut Cl, name: *const c_char, link: u32, writable: i32, tls: i32) -> Data {
     let c = cl(c);
     let l = linkage(link);
     let id = module(c).declare_data(cstr(name), l, writable != 0, tls != 0).expect("declare_data");
@@ -521,7 +521,7 @@ pub unsafe extern "C" fn ms_cl_declare_data(c: *mut Cl, name: *const c_char, lin
 
 /// Defines a data object of `len` bytes: `bytes` (null for zeros), alignment `align`, and `n` relocations.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_define_data(c: *mut Cl, data: Data, bytes: *const u8, len: u32, align: u32, relocs: *const ClReloc, n: u32) {
+pub unsafe extern "C" fn cl_define_data(c: *mut Cl, data: Data, bytes: *const u8, len: u32, align: u32, relocs: *const ClReloc, n: u32) {
     let c = cl(c);
     let mut d = DataDescription::new();
     if bytes.is_null() && n == 0 {
@@ -555,21 +555,21 @@ pub unsafe extern "C" fn ms_cl_define_data(c: *mut Cl, data: Data, bytes: *const
 }
 
 /// Names the source file `index` for the line table; `path` is as the debugger should show it. The line table is
-/// written at `ms_cl_finish` when at least one file is named.
+/// written at `cl_finish` when at least one file is named.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_dwarf_file(c: *mut Cl, index: u32, path: *const c_char) {
+pub unsafe extern "C" fn cl_dwarf_file(c: *mut Cl, index: u32, path: *const c_char) {
     cl(c).files.push((index, cstr(path).to_string()));
 }
 
 /// The compilation directory recorded in the line table.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_dwarf_dir(c: *mut Cl, dir: *const c_char) {
+pub unsafe extern "C" fn cl_dwarf_dir(c: *mut Cl, dir: *const c_char) {
     cl(c).comp_dir = cstr(dir).to_string();
 }
 
 /// The name a debugger shows for `func` (default: its symbol name).
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_func_name(c: *mut Cl, func: Func, name: *const c_char) {
+pub unsafe extern "C" fn cl_func_name(c: *mut Cl, func: Func, name: *const c_char) {
     cl(c).run.info.lock().unwrap()[func.0 as usize].name = Some(cstr(name).to_string());
 }
 
@@ -577,7 +577,7 @@ pub unsafe extern "C" fn ms_cl_func_name(c: *mut Cl, func: Func, name: *const c_
 
 /// A builder for the functions of module `c`. One per thread that builds; reuse it function after function.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fn_new(c: *mut Cl) -> *mut Fnb {
+pub unsafe extern "C" fn cl_fn_new(c: *mut Cl) -> *mut Fnb {
     let c = &*c; // shared: builders are made on the threads that build
     Box::into_raw(Box::new(Fnb {
         isa: c.isa.clone(),
@@ -601,7 +601,7 @@ pub unsafe extern "C" fn ms_cl_fn_new(c: *mut Cl) -> *mut Fnb {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fn_free(f: *mut Fnb) {
+pub unsafe extern "C" fn cl_fn_free(f: *mut Fnb) {
     if !f.is_null() {
         let mut f = Box::from_raw(f);
         f.builder = None;
@@ -609,13 +609,13 @@ pub unsafe extern "C" fn ms_cl_fn_free(f: *mut Fnb) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fn_error(f: *mut Fnb) -> *const c_char {
+pub unsafe extern "C" fn cl_fn_error(f: *mut Fnb) -> *const c_char {
     fb(f).err.as_ptr()
 }
 
-/// Starts the body of a declared function. Create its blocks next; `ms_cl_entry` makes the entry block.
+/// Starts the body of a declared function. Create its blocks next; `cl_entry` makes the entry block.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fn_begin(f: *mut Fnb, func: Func) {
+pub unsafe extern "C" fn cl_fn_begin(f: *mut Fnb, func: Func) {
     let c = fb(f);
     if c.builder.take().is_some() {
         // A function abandoned half built leaves its blocks in the SSA state.
@@ -642,11 +642,11 @@ pub unsafe extern "C" fn ms_cl_fn_begin(f: *mut Fnb, func: Func) {
     c.builder = Some(FunctionBuilder::new(func_ref, fc));
 }
 
-/// The source place of the instructions that follow: module file index, line and scope (the column of a DWARF row).
+/// The source place of the instructions that follow: module file index, line and column of a DWARF row.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_srcloc(f: *mut Fnb, file: u32, line: u32, scope: u32) {
+pub unsafe extern "C" fn cl_srcloc(f: *mut Fnb, file: u32, line: u32, column: u32) {
     let c = fb(f);
-    let key = (file, line, scope);
+    let key = (file, line, column);
     let ix = match c.loc_ix.get(&key) {
         Some(i) => *i,
         None => {
@@ -698,7 +698,7 @@ fn gref(c: &mut Fnb, data: Data) -> GlobalValue {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_func_addr(f: *mut Fnb, func: Func) -> Val {
+pub unsafe extern "C" fn cl_func_addr(f: *mut Fnb, func: Func) -> Val {
     let c = fb(f);
     let r = fref(c, func);
     let v = bld(c).ins().func_addr(types::I64, r);
@@ -707,7 +707,7 @@ pub unsafe extern "C" fn ms_cl_func_addr(f: *mut Fnb, func: Func) -> Val {
 
 /// The address of a data object (a symbol value).
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_data_addr(f: *mut Fnb, data: Data) -> Val {
+pub unsafe extern "C" fn cl_data_addr(f: *mut Fnb, data: Data) -> Val {
     let c = fb(f);
     let g = gref(c, data);
     let v = bld(c).ins().symbol_value(types::I64, g);
@@ -724,7 +724,7 @@ unsafe fn results(c: &mut Fnb, inst: ir::Inst, rets: *mut Val) {
 
 /// Calls function `func`; the results go to `rets`, one per value its signature returns (null when none).
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_call(f: *mut Fnb, func: Func, args: *const Val, n: u32, rets: *mut Val) {
+pub unsafe extern "C" fn cl_call(f: *mut Fnb, func: Func, args: *const Val, n: u32, rets: *mut Val) {
     let c = fb(f);
     let a = values(c, args, n);
     let r = fref(c, func);
@@ -734,7 +734,7 @@ pub unsafe extern "C" fn ms_cl_call(f: *mut Fnb, func: Func, args: *const Val, n
 
 /// Calls the code address `callee` with signature `sig`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_call_indirect(f: *mut Fnb, sig: SigId, callee: Val, args: *const Val, n: u32, rets: *mut Val) {
+pub unsafe extern "C" fn cl_call_indirect(f: *mut Fnb, sig: SigId, callee: Val, args: *const Val, n: u32, rets: *mut Val) {
     let c = fb(f);
     let a = values(c, args, n);
     let callee = val(c, callee);
@@ -753,20 +753,20 @@ pub unsafe extern "C" fn ms_cl_call_indirect(f: *mut Fnb, sig: SigId, callee: Va
 
 /// The Cranelift IR of the function being built (or just compiled), valid until the next call on `f`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_dump(f: *mut Fnb) -> *const c_char {
+pub unsafe extern "C" fn cl_dump(f: *mut Fnb) -> *const c_char {
     let c = fb(f);
     c.dump = cerr(c.ctx.func.display());
     c.dump.as_ptr()
 }
 
-/// Finishes the function and queues it for the module's workers (compiled on this thread when `ms_threads` is 1). The
-/// builder may begin its next function at once. Compile errors surface from `ms_cl_wait` or `ms_cl_finish`, named by
+/// Finishes the function and queues it for the module's workers (compiled on this thread when `threads` is 1). The
+/// builder may begin its next function at once. Compile errors surface from `cl_wait` or `cl_finish`, named by
 /// function. Returns 0.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fn_end(f: *mut Fnb) -> i32 {
+pub unsafe extern "C" fn cl_fn_end(f: *mut Fnb) -> i32 {
     let c = fb(f);
     let cfg = c.isa.frontend_config();
-    c.builder.take().expect("ms_cl_fn_begin was not called").finalize(cfg);
+    c.builder.take().expect("cl_fn_begin was not called").finalize(cfg);
     let func = c.cur;
     let id = c.decls.read().unwrap().funcs[func as usize].id;
     let fresh = c.run.spare.lock().unwrap().pop().unwrap_or_else(Context::new);
@@ -776,9 +776,9 @@ pub unsafe extern "C" fn ms_cl_fn_end(f: *mut Fnb) -> i32 {
     0
 }
 
-/// Waits for every queued function. Returns 0, or 1 with the first error (in declaration order) in `ms_cl_error`.
+/// Waits for every queued function. Returns 0, or 1 with the first error (in declaration order) in `cl_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_wait(c: *mut Cl) -> i32 {
+pub unsafe extern "C" fn cl_wait(c: *mut Cl) -> i32 {
     let c = cl(c);
     c.run.wait();
     let mut errors = c.run.errors.lock().unwrap();
@@ -795,7 +795,7 @@ pub unsafe extern "C" fn ms_cl_wait(c: *mut Cl) -> i32 {
 // ---- Blocks, values and instructions -----------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_block_new(f: *mut Fnb) -> BlockId {
+pub unsafe extern "C" fn cl_block_new(f: *mut Fnb) -> BlockId {
     let c = fb(f);
     let b = bld(c).create_block();
     c.blocks.push(b);
@@ -803,7 +803,7 @@ pub unsafe extern "C" fn ms_cl_block_new(f: *mut Fnb) -> BlockId {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_block_param_add(f: *mut Fnb, blk: BlockId, t: u32) -> Val {
+pub unsafe extern "C" fn cl_block_param_add(f: *mut Fnb, blk: BlockId, t: u32) -> Val {
     let c = fb(f);
     let b = c.blocks[blk.0 as usize];
     let v = bld(c).append_block_param(b, ty(t));
@@ -811,7 +811,7 @@ pub unsafe extern "C" fn ms_cl_block_param_add(f: *mut Fnb, blk: BlockId, t: u32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_block_param(f: *mut Fnb, blk: BlockId, i: u32) -> Val {
+pub unsafe extern "C" fn cl_block_param(f: *mut Fnb, blk: BlockId, i: u32) -> Val {
     let c = fb(f);
     let b = c.blocks[blk.0 as usize];
     let v = bld(c).block_params(b)[i as usize];
@@ -819,7 +819,7 @@ pub unsafe extern "C" fn ms_cl_block_param(f: *mut Fnb, blk: BlockId, i: u32) ->
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_entry(f: *mut Fnb) -> BlockId {
+pub unsafe extern "C" fn cl_entry(f: *mut Fnb) -> BlockId {
     let c = fb(f);
     let b = bld(c).create_block();
     bld(c).append_block_params_for_function_params(b);
@@ -829,33 +829,33 @@ pub unsafe extern "C" fn ms_cl_entry(f: *mut Fnb) -> BlockId {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_enter(f: *mut Fnb, blk: BlockId) {
+pub unsafe extern "C" fn cl_enter(f: *mut Fnb, blk: BlockId) {
     let c = fb(f);
     let b = c.blocks[blk.0 as usize];
     bld(c).switch_to_block(b);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_seal(f: *mut Fnb, blk: BlockId) {
+pub unsafe extern "C" fn cl_seal(f: *mut Fnb, blk: BlockId) {
     let c = fb(f);
     let b = c.blocks[blk.0 as usize];
     bld(c).seal_block(b);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_seal_all(f: *mut Fnb) {
+pub unsafe extern "C" fn cl_seal_all(f: *mut Fnb) {
     bld(fb(f)).seal_all_blocks();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_cold(f: *mut Fnb, blk: BlockId) {
+pub unsafe extern "C" fn cl_cold(f: *mut Fnb, blk: BlockId) {
     let c = fb(f);
     let b = c.blocks[blk.0 as usize];
     bld(c).set_cold_block(b);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_stack_slot(f: *mut Fnb, size: u32, align_shift: u8) -> SlotId {
+pub unsafe extern "C" fn cl_stack_slot(f: *mut Fnb, size: u32, align_shift: u8) -> SlotId {
     let c = fb(f);
     let s = bld(c).create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align_shift));
     c.slots.push(s);
@@ -863,7 +863,7 @@ pub unsafe extern "C" fn ms_cl_stack_slot(f: *mut Fnb, size: u32, align_shift: u
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_stack_addr(f: *mut Fnb, slot: SlotId, off: i32) -> Val {
+pub unsafe extern "C" fn cl_stack_addr(f: *mut Fnb, slot: SlotId, off: i32) -> Val {
     let c = fb(f);
     let s = c.slots[slot.0 as usize];
     let v = bld(c).ins().stack_addr(types::I64, s, off);
@@ -871,35 +871,35 @@ pub unsafe extern "C" fn ms_cl_stack_addr(f: *mut Fnb, slot: SlotId, off: i32) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_sp(f: *mut Fnb) -> Val {
+pub unsafe extern "C" fn cl_sp(f: *mut Fnb) -> Val {
     let c = fb(f);
     let v = bld(c).ins().get_stack_pointer(types::I64);
     push(c, v)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_iconst(f: *mut Fnb, t: u32, k: i64) -> Val {
+pub unsafe extern "C" fn cl_iconst(f: *mut Fnb, t: u32, k: i64) -> Val {
     let c = fb(f);
     let v = bld(c).ins().iconst(ty(t), k);
     push(c, v)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_f32const(f: *mut Fnb, k: f32) -> Val {
+pub unsafe extern "C" fn cl_f32const(f: *mut Fnb, k: f32) -> Val {
     let c = fb(f);
     let v = bld(c).ins().f32const(k);
     push(c, v)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_f64const(f: *mut Fnb, k: f64) -> Val {
+pub unsafe extern "C" fn cl_f64const(f: *mut Fnb, k: f64) -> Val {
     let c = fb(f);
     let v = bld(c).ins().f64const(k);
     push(c, v)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_unary(f: *mut Fnb, op: u32, x: Val) -> Val {
+pub unsafe extern "C" fn cl_unary(f: *mut Fnb, op: u32, x: Val) -> Val {
     let c = fb(f);
     let x = val(c, x);
     let i = bld(c).ins();
@@ -925,7 +925,7 @@ pub unsafe extern "C" fn ms_cl_unary(f: *mut Fnb, op: u32, x: Val) -> Val {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_binary(f: *mut Fnb, op: u32, x: Val, y: Val) -> Val {
+pub unsafe extern "C" fn cl_binary(f: *mut Fnb, op: u32, x: Val, y: Val) -> Val {
     let c = fb(f);
     let (x, y) = (val(c, x), val(c, y));
     let i = bld(c).ins();
@@ -967,7 +967,7 @@ pub unsafe extern "C" fn ms_cl_binary(f: *mut Fnb, op: u32, x: Val, y: Val) -> V
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_ovf(f: *mut Fnb, op: u32, x: Val, y: Val) -> Ovf {
+pub unsafe extern "C" fn cl_ovf(f: *mut Fnb, op: u32, x: Val, y: Val) -> Ovf {
     let c = fb(f);
     let (x, y) = (val(c, x), val(c, y));
     let i = bld(c).ins();
@@ -984,7 +984,7 @@ pub unsafe extern "C" fn ms_cl_ovf(f: *mut Fnb, op: u32, x: Val, y: Val) -> Ovf 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_cast(f: *mut Fnb, op: u32, t: u32, x: Val) -> Val {
+pub unsafe extern "C" fn cl_cast(f: *mut Fnb, op: u32, t: u32, x: Val) -> Val {
     let c = fb(f);
     let (t, x) = (ty(t), val(c, x));
     let i = bld(c).ins();
@@ -1007,7 +1007,7 @@ pub unsafe extern "C" fn ms_cl_cast(f: *mut Fnb, op: u32, t: u32, x: Val) -> Val
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_icmp(f: *mut Fnb, cc: u32, x: Val, y: Val) -> Val {
+pub unsafe extern "C" fn cl_icmp(f: *mut Fnb, cc: u32, x: Val, y: Val) -> Val {
     let c = fb(f);
     let cc = match cc {
         0 => IntCC::Equal,
@@ -1028,7 +1028,7 @@ pub unsafe extern "C" fn ms_cl_icmp(f: *mut Fnb, cc: u32, x: Val, y: Val) -> Val
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fcmp(f: *mut Fnb, cc: u32, x: Val, y: Val) -> Val {
+pub unsafe extern "C" fn cl_fcmp(f: *mut Fnb, cc: u32, x: Val, y: Val) -> Val {
     let c = fb(f);
     let cc = match cc {
         0 => FloatCC::Equal,
@@ -1053,7 +1053,7 @@ pub unsafe extern "C" fn ms_cl_fcmp(f: *mut Fnb, cc: u32, x: Val, y: Val) -> Val
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_select(f: *mut Fnb, cond: Val, a: Val, b: Val) -> Val {
+pub unsafe extern "C" fn cl_select(f: *mut Fnb, cond: Val, a: Val, b: Val) -> Val {
     let c = fb(f);
     let (cond, a, b) = (val(c, cond), val(c, a), val(c, b));
     let v = bld(c).ins().select(cond, a, b);
@@ -1061,7 +1061,7 @@ pub unsafe extern "C" fn ms_cl_select(f: *mut Fnb, cond: Val, a: Val, b: Val) ->
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_load(f: *mut Fnb, t: u32, flags: u32, base: Val, off: i32) -> Val {
+pub unsafe extern "C" fn cl_load(f: *mut Fnb, t: u32, flags: u32, base: Val, off: i32) -> Val {
     let c = fb(f);
     let base = val(c, base);
     let v = bld(c).ins().load(ty(t), mflags(flags), base, off);
@@ -1069,7 +1069,7 @@ pub unsafe extern "C" fn ms_cl_load(f: *mut Fnb, t: u32, flags: u32, base: Val, 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_load_ext(f: *mut Fnb, bits: u32, signed: i32, t: u32, flags: u32, base: Val, off: i32) -> Val {
+pub unsafe extern "C" fn cl_load_ext(f: *mut Fnb, bits: u32, signed: i32, t: u32, flags: u32, base: Val, off: i32) -> Val {
     let c = fb(f);
     let (t, f, base) = (ty(t), mflags(flags), val(c, base));
     let i = bld(c).ins();
@@ -1086,7 +1086,7 @@ pub unsafe extern "C" fn ms_cl_load_ext(f: *mut Fnb, bits: u32, signed: i32, t: 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_store(f: *mut Fnb, flags: u32, v: Val, base: Val, off: i32) {
+pub unsafe extern "C" fn cl_store(f: *mut Fnb, flags: u32, v: Val, base: Val, off: i32) {
     let c = fb(f);
     let (v, base) = (val(c, v), val(c, base));
     bld(c).ins().store(mflags(flags), v, base, off);
@@ -1095,7 +1095,7 @@ pub unsafe extern "C" fn ms_cl_store(f: *mut Fnb, flags: u32, v: Val, base: Val,
 /// Copies `bytes` bytes (a constant) from `src` to `dst`; the ranges must not overlap. Small sizes become loads and
 /// stores, larger ones a call of the C library's `memcpy`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_copy(f: *mut Fnb, dst: Val, src: Val, bytes: u32) {
+pub unsafe extern "C" fn cl_copy(f: *mut Fnb, dst: Val, src: Val, bytes: u32) {
     let c = fb(f);
     let (dst, src) = (val(c, dst), val(c, src));
     let cfg = c.isa.frontend_config();
@@ -1110,7 +1110,7 @@ pub unsafe extern "C" fn ms_cl_copy(f: *mut Fnb, dst: Val, src: Val, bytes: u32)
 
 /// Copies `n` bytes (a value) from `src` to `dst`: the C library's `memmove`, so the ranges may overlap.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_copy_dyn(f: *mut Fnb, dst: Val, src: Val, n: Val) {
+pub unsafe extern "C" fn cl_copy_dyn(f: *mut Fnb, dst: Val, src: Val, n: Val) {
     let c = fb(f);
     let (dst, src, n) = (val(c, dst), val(c, src), val(c, n));
     let cfg = c.isa.frontend_config();
@@ -1119,7 +1119,7 @@ pub unsafe extern "C" fn ms_cl_copy_dyn(f: *mut Fnb, dst: Val, src: Val, n: Val)
 
 /// Sets `bytes` bytes (a constant) at `dst` to `byte`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fill(f: *mut Fnb, dst: Val, byte: u8, bytes: u32) {
+pub unsafe extern "C" fn cl_fill(f: *mut Fnb, dst: Val, byte: u8, bytes: u32) {
     let c = fb(f);
     let dst = val(c, dst);
     let cfg = c.isa.frontend_config();
@@ -1134,7 +1134,7 @@ pub unsafe extern "C" fn ms_cl_fill(f: *mut Fnb, dst: Val, byte: u8, bytes: u32)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_store_trunc(f: *mut Fnb, bits: u32, flags: u32, v: Val, base: Val, off: i32) {
+pub unsafe extern "C" fn cl_store_trunc(f: *mut Fnb, bits: u32, flags: u32, v: Val, base: Val, off: i32) {
     let c = fb(f);
     let (f, v, base) = (mflags(flags), val(c, v), val(c, base));
     let i = bld(c).ins();
@@ -1147,7 +1147,7 @@ pub unsafe extern "C" fn ms_cl_store_trunc(f: *mut Fnb, bits: u32, flags: u32, v
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_atomic_load(f: *mut Fnb, t: u32, flags: u32, addr: Val) -> Val {
+pub unsafe extern "C" fn cl_atomic_load(f: *mut Fnb, t: u32, flags: u32, addr: Val) -> Val {
     let c = fb(f);
     let addr = val(c, addr);
     let v = bld(c).ins().atomic_load(ty(t), mflags(flags), addr);
@@ -1155,14 +1155,14 @@ pub unsafe extern "C" fn ms_cl_atomic_load(f: *mut Fnb, t: u32, flags: u32, addr
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_atomic_store(f: *mut Fnb, flags: u32, v: Val, addr: Val) {
+pub unsafe extern "C" fn cl_atomic_store(f: *mut Fnb, flags: u32, v: Val, addr: Val) {
     let c = fb(f);
     let (v, addr) = (val(c, v), val(c, addr));
     bld(c).ins().atomic_store(mflags(flags), v, addr);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_atomic_rmw(f: *mut Fnb, op: u32, t: u32, flags: u32, addr: Val, x: Val) -> Val {
+pub unsafe extern "C" fn cl_atomic_rmw(f: *mut Fnb, op: u32, t: u32, flags: u32, addr: Val, x: Val) -> Val {
     let c = fb(f);
     let op = match op {
         0 => AtomicRmwOp::Add,
@@ -1184,7 +1184,7 @@ pub unsafe extern "C" fn ms_cl_atomic_rmw(f: *mut Fnb, op: u32, t: u32, flags: u
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_atomic_cas(f: *mut Fnb, flags: u32, addr: Val, expected: Val, new: Val) -> Val {
+pub unsafe extern "C" fn cl_atomic_cas(f: *mut Fnb, flags: u32, addr: Val, expected: Val, new: Val) -> Val {
     let c = fb(f);
     let (addr, e, n) = (val(c, addr), val(c, expected), val(c, new));
     let v = bld(c).ins().atomic_cas(mflags(flags), addr, e, n);
@@ -1192,12 +1192,12 @@ pub unsafe extern "C" fn ms_cl_atomic_cas(f: *mut Fnb, flags: u32, addr: Val, ex
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_fence(f: *mut Fnb) {
+pub unsafe extern "C" fn cl_fence(f: *mut Fnb) {
     bld(fb(f)).ins().fence();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_jump(f: *mut Fnb, blk: BlockId, args: *const Val, n: u32) {
+pub unsafe extern "C" fn cl_jump(f: *mut Fnb, blk: BlockId, args: *const Val, n: u32) {
     let c = fb(f);
     let a = block_args(c, args, n);
     let b = c.blocks[blk.0 as usize];
@@ -1205,7 +1205,7 @@ pub unsafe extern "C" fn ms_cl_jump(f: *mut Fnb, blk: BlockId, args: *const Val,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_brif(
+pub unsafe extern "C" fn cl_brif(
     f: *mut Fnb,
     cond: Val,
     t: BlockId,
@@ -1223,7 +1223,7 @@ pub unsafe extern "C" fn ms_cl_brif(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_switch(f: *mut Fnb, v: Val, default: BlockId, keys: *const u64, targets: *const BlockId, n: u32) {
+pub unsafe extern "C" fn cl_switch(f: *mut Fnb, v: Val, default: BlockId, keys: *const u64, targets: *const BlockId, n: u32) {
     let c = fb(f);
     let (keys, targets) = (list(keys, n), list(targets, n));
     let mut sw = Switch::new();
@@ -1235,14 +1235,14 @@ pub unsafe extern "C" fn ms_cl_switch(f: *mut Fnb, v: Val, default: BlockId, key
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_ret(f: *mut Fnb, args: *const Val, n: u32) {
+pub unsafe extern "C" fn cl_ret(f: *mut Fnb, args: *const Val, n: u32) {
     let c = fb(f);
     let vs = values(c, args, n);
     bld(c).ins().return_(&vs);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_trap(f: *mut Fnb, code: u8) {
+pub unsafe extern "C" fn cl_trap(f: *mut Fnb, code: u8) {
     bld(fb(f)).ins().trap(TrapCode::unwrap_user(code));
 }
 
@@ -1269,7 +1269,7 @@ impl RelocateWriter for Section {
 }
 
 /// Writes the line table (DWARF 4, a compile unit with a subprogram per function) into the object, with relocations
-/// against the function symbols. A row's column is the scope number, as in the LLVM route.
+/// against the function symbols. A row's column is the value given to `cl_srcloc`.
 fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(), String> {
     if c.files.is_empty() {
         return Ok(());
@@ -1295,7 +1295,7 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
     dwarf.unit.get_mut(root).set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
     dwarf.unit.get_mut(root).set(gimli::DW_AT_name, AttributeValue::String(first.into_bytes()));
     dwarf.unit.get_mut(root).set(gimli::DW_AT_comp_dir, AttributeValue::String(c.comp_dir.clone().into_bytes()));
-    dwarf.unit.get_mut(root).set(gimli::DW_AT_producer, AttributeValue::String(b"Manuscript Cranelift".to_vec()));
+    dwarf.unit.get_mut(root).set(gimli::DW_AT_producer, AttributeValue::String(b"Cranelift".to_vec()));
     let mut symbols = Vec::new();
     let mut ranges = Vec::new();
     let infos = c.run.info.lock().unwrap();
@@ -1325,7 +1325,7 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
             lines.row().address_offset = u64::from(r.off);
             lines.row().file = *file;
             lines.row().line = u64::from(r.line);
-            lines.row().column = u64::from(r.scope);
+            lines.row().column = u64::from(r.column);
             lines.generate_row();
             end = Some(r.end);
         }
@@ -1393,7 +1393,7 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
 fn finish(c: &mut Cl) -> Result<Vec<u8>, String> {
     let ids: Vec<FuncId> = c.decls.read().unwrap().funcs.iter().map(|f| f.id).collect();
     let data_ids: Vec<DataId> = c.decls.read().unwrap().datas.iter().map(|d| d.id).collect();
-    if unsafe { ms_cl_wait(c) } != 0 {
+    if unsafe { cl_wait(c) } != 0 {
         return Err(c.err.to_string_lossy().into_owned());
     }
     let mut module = c.module.take().ok_or("finished twice")?;
@@ -1431,10 +1431,10 @@ fn finish(c: &mut Cl) -> Result<Vec<u8>, String> {
     product.emit().map_err(|e| e.to_string())
 }
 
-/// Writes the object. The bytes stay valid until `ms_cl_free`. After this the module accepts no more input.
-/// Null on failure, with the message in `ms_cl_error`.
+/// Writes the object. The bytes stay valid until `cl_free`. After this the module accepts no more input.
+/// Null on failure, with the message in `cl_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_finish(c: *mut Cl, len: *mut usize) -> *const u8 {
+pub unsafe extern "C" fn cl_finish(c: *mut Cl, len: *mut usize) -> *const u8 {
     let c = cl(c);
     match finish(c) {
         Ok(bytes) => {
@@ -1450,18 +1450,18 @@ pub unsafe extern "C" fn ms_cl_finish(c: *mut Cl, len: *mut usize) -> *const u8 
     }
 }
 
-/// Offset of `func` in the object's text section and its size in bytes; valid after `ms_cl_finish`.
+/// Offset of `func` in the object's text section and its size in bytes; valid after `cl_finish`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_func_info(c: *mut Cl, func: Func, offset: *mut u64, size: *mut u32) {
+pub unsafe extern "C" fn cl_func_info(c: *mut Cl, func: Func, offset: *mut u64, size: *mut u32) {
     let info = cl(c).run.info.lock().unwrap();
     let i = &info[func.0 as usize];
     *offset = i.offset;
     *size = i.size;
 }
 
-/// The code ranges of `func` with their source places, sorted by offset: what the fault tables are built from.
+/// The code ranges of `func` with their source places, sorted by offset: for example to build tables mapping code addresses to places.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_func_ranges(c: *mut Cl, func: Func, n: *mut u32) -> *const ClCodeRange {
+pub unsafe extern "C" fn cl_func_ranges(c: *mut Cl, func: Func, n: *mut u32) -> *const ClCodeRange {
     let info = cl(c).run.info.lock().unwrap();
     let i = &info[func.0 as usize];
     *n = i.ranges.len() as u32;

@@ -5,7 +5,7 @@ set -eu
 os=$1 arch=$2
 version=$(tr -d '[:space:]' < "$(dirname "$0")/cranelift-version")
 case "$arch" in amd64) feat=x86 ;; arm64) feat=arm64 ;; *) echo "bad arch $arch" >&2; exit 1 ;; esac
-case "$os" in linux) lib=libms_cranelift.so ;; darwin) lib=libms_cranelift.dylib ;; windows) lib=ms_cranelift.dll ;; *) echo "bad os $os" >&2; exit 1 ;; esac
+case "$os" in linux) lib=libcranelift.so ;; darwin) lib=libcranelift.dylib ;; windows) lib=cranelift.dll ;; *) echo "bad os $os" >&2; exit 1 ;; esac
 cd "$(dirname "$0")"
 sh apply-patches.sh
 # shellcheck disable=SC2046
@@ -13,7 +13,7 @@ cargo build --release --locked $(sh patch-config.sh) --no-default-features --fea
 out=dist/stage/cranelift-lib
 rm -rf dist/stage && mkdir -p "$out/lib" "$out/include" dist
 if [ "$os" = windows ]; then mkdir -p "$out/bin"; cp "target/release/$lib" "$out/bin/"; else cp "target/release/$lib" "$out/lib/"; fi
-cp include/ms_cranelift.h "$out/include/"
+cp include/cranelift.h "$out/include/"
 name="cranelift-lib-$version-$os-$arch.tar.gz"
 tar -C dist/stage -czf "dist/$name" cranelift-lib
 rm -rf dist/stage

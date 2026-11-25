@@ -72,23 +72,23 @@ jobs:
       - name: Smoke test (load the library by path, build functions with it, link and run them)
         run: |
           case "${{ matrix.os }}" in
-            linux)   cc smoke/smoke.c -ldl -lpthread -o smoke-test && ./smoke-test target/release/libms_cranelift.so smoke.o
+            linux)   cc smoke/smoke.c -ldl -lpthread -o smoke-test && ./smoke-test target/release/libcranelift.so smoke.o
                      cc smoke/main.c smoke.o -o smoke-run && ./smoke-run
-                     readelf --debug-dump=decodedline smoke.o > lines.txt && grep -q 'smoke.ms *42' lines.txt ;;
-            darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib smoke.o
+                     readelf --debug-dump=decodedline smoke.o > lines.txt && grep -q 'smoke.src *42' lines.txt ;;
+            darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libcranelift.dylib smoke.o
                      cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
-            windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll smoke.obj
+            windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/cranelift.dll smoke.obj
                      clang smoke/main.c smoke.obj -o smoke-run.exe && ./smoke-run.exe ;;
           esac
       - name: Check the platform floor
         # The floors llvm-bundle holds: glibc 2.28 (manuscript's own script), macOS 12.0, a static Windows C runtime.
         run: |
           case "${{ matrix.os }}" in
-            linux)   sh check-glibc-floor.sh target/release/libms_cranelift.so ;;
-            darwin)  minos=$(otool -l target/release/libms_cranelift.dylib | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
+            linux)   sh check-glibc-floor.sh target/release/libcranelift.so ;;
+            darwin)  minos=$(otool -l target/release/libcranelift.dylib | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
                      echo "macOS minos: $minos"
                      case "$minos" in 12.0 | 11.* | 10.*) ;; *) echo "needs macOS $minos, above the 12.0 floor" >&2; exit 1 ;; esac ;;
-            windows) llvm-objdump -p target/release/ms_cranelift.dll | grep 'DLL Name' | tee floor.txt
+            windows) llvm-objdump -p target/release/cranelift.dll | grep 'DLL Name' | tee floor.txt
                      ! grep -qiE 'vcruntime|msvcp|api-ms-win-crt|ucrtbase' floor.txt ;;
           esac
       - run: cat dist-summary.txt
@@ -116,6 +116,6 @@ jobs:
         run: |
           version=$(tr -d '[:space:]' < cranelift-version)
           case "$TAG" in "cranelift-$version-r"*) ;; *) echo "tag $TAG does not match cranelift-version $version" >&2; exit 1 ;; esac
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --target "${{ github.sha }}" --title "$TAG" --notes "Cranelift $version shared library for Manuscript, one per platform. Verify downloads against checksums pinned in the consumer."
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --target "${{ github.sha }}" --title "$TAG" --notes "Cranelift $version shared library, one per platform. Verify downloads against checksums pinned in the consumer."
           cd assets && cat -- *.sha256 | sort -k2 > SHA256SUMS && cd ..
           gh release upload "$TAG" --clobber assets/*
