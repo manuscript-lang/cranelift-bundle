@@ -30,13 +30,13 @@ ms_cl_fn_begin(f, add);
 ms_cl_block b = ms_cl_entry(f);
 ms_cl_ret1(f, ms_cl_iadd(f, ms_cl_block_param(f, b, 0), ms_cl_block_param(f, b, 1)));
 ms_cl_seal_all(f);
-if (ms_cl_fn_end(f) || ms_cl_define(c, f)) fprintf(stderr, "%s\n", ms_cl_error(c));
+ms_cl_fn_end(f);  /* queued; ms_cl_wait or ms_cl_finish reports errors */
 size_t n; const uint8_t *object = ms_cl_finish(c, &n);     // relocatable object, valid until ms_cl_free
 ```
 
 The surface covers i8 to i64 and f32/f64 values, arithmetic, checked arithmetic, conversions, compares, select, loads and stores (narrow and widening), atomics, stack slots, data with relocations, direct and indirect calls, branches, `switch`, traps and cold blocks. Settings (`opt_level`, `regalloc_algorithm=single_pass`, ...) pass through `ms_cl_new`.
 
-**Parallel compilation.** Declare every signature, function and data object first. Then each thread owns a builder (`ms_cl_fn`), builds and compiles functions (`ms_cl_fn_end`) without touching shared state, and hands each result to the module with `ms_cl_define`, from any thread in any order. `ms_cl_finish` writes the code in declaration order, so the object is the same however the threads interleave.
+**Parallel compilation.** Declare every signature, function and data object first. `ms_cl_fn_end` queues the function for worker threads inside the library (Rust threads; `ms_threads` key, default one per core, 1 = compile on the calling thread), so the caller needs no threads of its own, and several builders on several threads work too. `ms_cl_wait` blocks until the queue is empty; `ms_cl_finish` writes the code in declaration order, so the object is the same however the workers interleave.
 
 **Fault tables and debug info.** `ms_cl_srcloc(f, file, line, scope)` marks the instructions that follow; `ms_cl_func_ranges` returns each function's code ranges as `{off, end, file, line, scope}`, the input of the tables Manuscript hands `msrt_start`, and `ms_cl_func_info` the function's size and text offset. Data relocations may point into a function (`function + addend`) or into data, which is how those tables hold code addresses. When files are named (`ms_cl_dwarf_file`), the object gets a DWARF 4 line table and a compile unit with a subprogram per function (names from `ms_cl_func_name`); a row's column is the scope number, as in the LLVM route's `.loc`.
 

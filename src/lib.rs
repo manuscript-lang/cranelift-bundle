@@ -32,7 +32,8 @@ use gimli::{Encoding, Format, LineEncoding, RunTimeEndian};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
+use std::thread;
 
 macro_rules! handle {
     ($($n:ident),*) => {$(
@@ -119,11 +120,7 @@ pub struct Cl {
     module: Option<ObjectModule>,
     isa: OwnedTargetIsa,
     decls: Shared,
-    /// Per function; written by `ms_cl_define`, which several threads may call.
-    info: Mutex<Vec<FuncInfo>>,
-    /// Compiled functions waiting for `ms_cl_finish`, which defines them in declaration order so the object does not
-    /// depend on which thread finished first.
-    pending: Mutex<Vec<Option<Compiled>>>,
+    run: Arc<Run>,
     late: Vec<LateReloc>,
     files: Vec<(u32, String)>,
     comp_dir: String,
@@ -135,6 +132,7 @@ pub struct Cl {
 pub struct Fnb {
     isa: OwnedTargetIsa,
     decls: Shared,
+    run: Arc<Run>,
     ctx: Context,
     fctx: FunctionBuilderContext,
     builder: Option<FunctionBuilder<'static>>,
@@ -148,17 +146,139 @@ pub struct Fnb {
     /// The (file, line, scope) of each `ms_cl_srcloc` call; a `SourceLoc` is an index into it.
     locs: Vec<(u32, u32, u32)>,
     loc_ix: HashMap<(u32, u32, u32), u32>,
-    compiled: Option<Compiled>,
     err: CString,
     dump: CString,
 }
 
 struct Compiled {
-    func: u32,
     code: Vec<u8>,
     align: u64,
     relocs: Vec<ModuleReloc>,
-    ranges: Vec<ClCodeRange>,
+}
+
+/// One function waiting for a worker: its finished IR and what turns source places into ranges.
+struct Job {
+    ctx: Context,
+    func: u32,
+    id: FuncId,
+    locs: Vec<(u32, u32, u32)>,
+}
+
+/// Compilation state shared by the module, its builders and the workers.
+struct Run {
+    isa: OwnedTargetIsa,
+    /// Worker threads (0 or 1: compile on the calling thread).
+    threads: usize,
+    /// The queue and the workers, started by the first job.
+    pool: Mutex<Pool>,
+    info: Mutex<Vec<FuncInfo>>,
+    /// Compiled functions waiting for `ms_cl_finish`, which defines them in declaration order so the object does not
+    /// depend on which worker finished first.
+    done: Mutex<Vec<Option<Compiled>>>,
+    errors: Mutex<Vec<(u32, String)>>,
+    /// Jobs queued or running; `idle` is signalled when it reaches zero.
+    pending: Mutex<usize>,
+    idle: Condvar,
+    /// Contexts kept for reuse: their allocations are most of the cost of starting a function.
+    spare: Mutex<Vec<Context>>,
+}
+
+#[derive(Default)]
+struct Pool {
+    sender: Option<mpsc::SyncSender<Job>>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl Run {
+    fn compile(&self, job: Job) {
+        let Job { mut ctx, func, id, locs } = job;
+        match compile_ctx(&self.isa, &mut ctx, id, &locs) {
+            Ok((compiled, ranges)) => {
+                let mut info = self.info.lock().unwrap();
+                let i = &mut info[func as usize];
+                i.size = compiled.code.len() as u32;
+                i.ranges = ranges;
+                i.defined = true;
+                drop(info);
+                self.done.lock().unwrap()[func as usize] = Some(compiled);
+            }
+            Err(e) => {
+                let name = self.info.lock().unwrap()[func as usize].name.clone().unwrap_or_default();
+                self.errors.lock().unwrap().push((func, format!("{name}: {e}")));
+            }
+        }
+        ctx.clear();
+        let mut spare = self.spare.lock().unwrap();
+        if spare.len() < 64 {
+            spare.push(ctx);
+        }
+        drop(spare);
+        let mut n = self.pending.lock().unwrap();
+        *n -= 1;
+        if *n == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn submit(self: &Arc<Self>, job: Job) {
+        *self.pending.lock().unwrap() += 1;
+        if self.threads <= 1 {
+            self.compile(job);
+            return;
+        }
+        let sender = {
+            let mut pool = self.pool.lock().unwrap();
+            if pool.sender.is_none() {
+                // A bounded queue: a lowering that outruns the workers waits instead of piling up IR.
+                let (tx, rx) = mpsc::sync_channel::<Job>(self.threads * 4);
+                let rx = Arc::new(Mutex::new(rx));
+                for _ in 0..self.threads {
+                    let (run, rx) = (self.clone(), rx.clone());
+                    let handle = thread::Builder::new().stack_size(8 << 20).spawn(move || loop {
+                        let job = rx.lock().unwrap().recv();
+                        match job {
+                            Ok(job) => run.compile(job),
+                            Err(_) => break,
+                        }
+                    });
+                    pool.workers.push(handle.expect("worker thread"));
+                }
+                pool.sender = Some(tx);
+            }
+            pool.sender.clone().unwrap()
+        };
+        sender.send(job).expect("workers are running");
+    }
+
+    fn wait(&self) {
+        let mut n = self.pending.lock().unwrap();
+        while *n > 0 {
+            n = self.idle.wait(n).unwrap();
+        }
+    }
+}
+
+impl Drop for Cl {
+    fn drop(&mut self) {
+        let mut pool = self.run.pool.lock().unwrap();
+        pool.sender = None; // the workers see the queue close and end
+        for w in pool.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
+fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32, u32, u32)]) -> Result<(Compiled, Vec<ClCodeRange>), String> {
+    ctx.compile(&**isa, &mut ControlPlane::default()).map_err(|e| format!("{e:?}"))?;
+    let cc = ctx.compiled_code().unwrap();
+    let size = cc.code_buffer().len() as u32;
+    let mut ranges = Vec::new();
+    for r in cc.buffer.get_srclocs_sorted() {
+        let (file, line, scope) = locs.get(r.loc.bits() as usize).copied().unwrap_or((u32::MAX, 0, 0));
+        ranges.push(ClCodeRange { off: r.start, end: r.end.min(size), file, line, scope });
+    }
+    let relocs = cc.buffer.relocs().iter().map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id)).collect();
+    Ok((Compiled { code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs }, ranges))
 }
 
 fn cl<'a>(c: *mut Cl) -> &'a mut Cl {
@@ -282,8 +402,15 @@ pub unsafe extern "C" fn ms_cl_new(triple: *const c_char, n: u32, keys: *const *
         set("enable_multi_ret_implicit_sret", "true")?;
         set("enable_probestack", "true")?;
         set("probestack_strategy", "inline")?;
+        // `ms_threads` is ours, not Cranelift's: how many workers compile functions (default: one per core).
+        let mut threads = thread::available_parallelism().map_or(1, |n| n.get());
         for i in 0..n as usize {
-            set(cstr(*keys.add(i)), cstr(*vals.add(i)))?;
+            let (k, v) = (cstr(*keys.add(i)), cstr(*vals.add(i)));
+            if k == "ms_threads" {
+                threads = v.parse().map_err(|_| format!("ms_threads={v}: not a number"))?;
+            } else {
+                set(k, v)?;
+            }
         }
         let isa: OwnedTargetIsa = isa::lookup(triple)
             .map_err(|e| e.to_string())?
@@ -292,10 +419,19 @@ pub unsafe extern "C" fn ms_cl_new(triple: *const c_char, n: u32, keys: *const *
         let ob = ObjectBuilder::new(isa.clone(), "ms", cranelift_module::default_libcall_names()).map_err(|e| e.to_string())?;
         Ok(Cl {
             module: Some(ObjectModule::new(ob)),
+            run: Arc::new(Run {
+                isa: isa.clone(),
+                threads,
+                pool: Mutex::default(),
+                info: Mutex::default(),
+                done: Mutex::default(),
+                errors: Mutex::default(),
+                pending: Mutex::new(0),
+                idle: Condvar::new(),
+                spare: Mutex::default(),
+            }),
             isa,
             decls: Shared::default(),
-            info: Mutex::new(vec![]),
-            pending: Mutex::new(vec![]),
             late: vec![],
             files: vec![],
             comp_dir: String::new(),
@@ -359,8 +495,8 @@ pub unsafe extern "C" fn ms_cl_declare_func(c: *mut Cl, name: *const c_char, sig
     let id = module(c).declare_function(cstr(name), l, &s).expect("declare_function");
     let mut d = c.decls.write().unwrap();
     d.funcs.push(FuncDecl { id, sig: sig.0, colocated: l.is_final() });
-    c.info.get_mut().unwrap().push(FuncInfo { name: Some(cstr(name).to_string()), ..FuncInfo::default() });
-    c.pending.get_mut().unwrap().push(None);
+    c.run.info.lock().unwrap().push(FuncInfo { name: Some(cstr(name).to_string()), ..FuncInfo::default() });
+    c.run.done.lock().unwrap().push(None);
     Func((d.funcs.len() - 1) as u32)
 }
 
@@ -426,7 +562,7 @@ pub unsafe extern "C" fn ms_cl_dwarf_dir(c: *mut Cl, dir: *const c_char) {
 /// The name a debugger shows for `func` (default: its symbol name).
 #[no_mangle]
 pub unsafe extern "C" fn ms_cl_func_name(c: *mut Cl, func: Func, name: *const c_char) {
-    cl(c).info.get_mut().unwrap()[func.0 as usize].name = Some(cstr(name).to_string());
+    cl(c).run.info.lock().unwrap()[func.0 as usize].name = Some(cstr(name).to_string());
 }
 
 // ---- Function builders -----------------------------------------------------------------------
@@ -438,6 +574,7 @@ pub unsafe extern "C" fn ms_cl_fn_new(c: *mut Cl) -> *mut Fnb {
     Box::into_raw(Box::new(Fnb {
         isa: c.isa.clone(),
         decls: c.decls.clone(),
+        run: c.run.clone(),
         ctx: Context::new(),
         fctx: FunctionBuilderContext::new(),
         builder: None,
@@ -450,7 +587,6 @@ pub unsafe extern "C" fn ms_cl_fn_new(c: *mut Cl) -> *mut Fnb {
         srefs: HashMap::new(),
         locs: vec![],
         loc_ix: HashMap::new(),
-        compiled: None,
         err: CString::default(),
         dump: CString::default(),
     }))
@@ -481,7 +617,6 @@ pub unsafe extern "C" fn ms_cl_fn_begin(f: *mut Fnb, func: Func) {
     }
     c.ctx.func.name = UserFuncName::user(0, func.0);
     c.cur = func.0;
-    c.compiled = None;
     c.blocks.clear();
     c.vals.clear();
     c.slots.clear();
@@ -613,8 +748,9 @@ pub unsafe extern "C" fn ms_cl_dump(f: *mut Fnb) -> *const c_char {
     c.dump.as_ptr()
 }
 
-/// Compiles the function; it touches nothing shared, so builders on different threads may run it at once. Returns 0, or 1 with the
-/// message in `ms_cl_fn_error`. Then `ms_cl_define` hands the code to the module.
+/// Finishes the function and queues it for the module's workers (compiled on this thread when `ms_threads` is 1). The
+/// builder may begin its next function at once. Compile errors surface from `ms_cl_wait` or `ms_cl_finish`, named by
+/// function. Returns 0.
 #[no_mangle]
 pub unsafe extern "C" fn ms_cl_fn_end(f: *mut Fnb) -> i32 {
     let c = fb(f);
@@ -622,38 +758,27 @@ pub unsafe extern "C" fn ms_cl_fn_end(f: *mut Fnb) -> i32 {
     c.builder.take().expect("ms_cl_fn_begin was not called").finalize(cfg);
     let func = c.cur;
     let id = c.decls.read().unwrap().funcs[func as usize].id;
-    let isa = c.isa.clone();
-    if let Err(e) = c.ctx.compile(&*isa, &mut ControlPlane::default()) {
-        c.err = cerr(format!("{e:?}"));
-        return 1;
-    }
-    let cc = c.ctx.compiled_code().unwrap();
-    let size = cc.code_buffer().len() as u32;
-    let mut ranges = Vec::new();
-    for r in cc.buffer.get_srclocs_sorted() {
-        let ix = r.loc.bits() as usize;
-        let (file, line, scope) = c.locs.get(ix).copied().unwrap_or((u32::MAX, 0, 0));
-        ranges.push(ClCodeRange { off: r.start, end: r.end.min(size), file, line, scope });
-    }
-    let relocs = cc.buffer.relocs().iter().map(|r| ModuleReloc::from_mach_reloc(r, &c.ctx.func, id)).collect();
-    c.compiled = Some(Compiled { func, code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs, ranges });
+    let fresh = c.run.spare.lock().unwrap().pop().unwrap_or_else(Context::new);
+    let ctx = std::mem::replace(&mut c.ctx, fresh);
+    let locs = std::mem::take(&mut c.locs);
+    c.run.submit(Job { ctx, func, id, locs });
     0
 }
 
-/// Hands the function `f` compiled to the module (any thread, any order: `ms_cl_finish` writes the code in declaration
-/// order, so the object is the same however the threads interleave). `f` may begin its next function afterwards.
+/// Waits for every queued function. Returns 0, or 1 with the first error (in declaration order) in `ms_cl_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ms_cl_define(c: *mut Cl, f: *mut Fnb) -> i32 {
-    let c = &*c;
-    let mut done = fb(f).compiled.take().expect("ms_cl_fn_end did not succeed");
-    let mut info = c.info.lock().unwrap();
-    let i = &mut info[done.func as usize];
-    i.size = done.code.len() as u32;
-    i.ranges = std::mem::take(&mut done.ranges);
-    i.defined = true;
-    let func = done.func as usize;
-    c.pending.lock().unwrap()[func] = Some(done);
-    0
+pub unsafe extern "C" fn ms_cl_wait(c: *mut Cl) -> i32 {
+    let c = cl(c);
+    c.run.wait();
+    let mut errors = c.run.errors.lock().unwrap();
+    errors.sort();
+    match errors.first() {
+        Some((_, e)) => {
+            c.err = cerr(e);
+            1
+        }
+        None => 0,
+    }
 }
 
 // ---- Blocks, values and instructions -----------------------------------------------------------
@@ -1121,7 +1246,7 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
     dwarf.unit.get_mut(root).set(gimli::DW_AT_producer, AttributeValue::String(b"Manuscript Cranelift".to_vec()));
     let mut symbols = Vec::new();
     let mut ranges = Vec::new();
-    let infos = c.info.lock().unwrap();
+    let infos = c.run.info.lock().unwrap();
     for (i, info) in infos.iter().enumerate() {
         if !info.defined || info.ranges.is_empty() {
             continue;
@@ -1216,13 +1341,18 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
 fn finish(c: &mut Cl) -> Result<Vec<u8>, String> {
     let ids: Vec<FuncId> = c.decls.read().unwrap().funcs.iter().map(|f| f.id).collect();
     let data_ids: Vec<DataId> = c.decls.read().unwrap().datas.iter().map(|d| d.id).collect();
+    if unsafe { ms_cl_wait(c) } != 0 {
+        return Err(c.err.to_string_lossy().into_owned());
+    }
     let mut module = c.module.take().ok_or("finished twice")?;
-    for done in c.pending.get_mut().unwrap().iter_mut().filter_map(Option::take) {
-        module.define_function_bytes(ids[done.func as usize], done.align, &done.code, &done.relocs).map_err(|e| format!("{e:?}"))?;
+    for (i, done) in c.run.done.lock().unwrap().iter_mut().enumerate() {
+        if let Some(done) = done.take() {
+            module.define_function_bytes(ids[i], done.align, &done.code, &done.relocs).map_err(|e| format!("{e:?}"))?;
+        }
     }
     let mut product = module.finish();
     for (i, id) in ids.iter().enumerate() {
-        let info = &mut c.info.get_mut().unwrap()[i];
+        let info = &mut c.run.info.lock().unwrap()[i];
         if info.defined {
             info.offset = product.object.symbol(product.function_symbol(*id)).value;
         }
@@ -1271,7 +1401,7 @@ pub unsafe extern "C" fn ms_cl_finish(c: *mut Cl, len: *mut usize) -> *const u8 
 /// Offset of `func` in the object's text section and its size in bytes; valid after `ms_cl_finish`.
 #[no_mangle]
 pub unsafe extern "C" fn ms_cl_func_info(c: *mut Cl, func: Func, offset: *mut u64, size: *mut u32) {
-    let info = cl(c).info.lock().unwrap();
+    let info = cl(c).run.info.lock().unwrap();
     let i = &info[func.0 as usize];
     *offset = i.offset;
     *size = i.size;
@@ -1280,7 +1410,7 @@ pub unsafe extern "C" fn ms_cl_func_info(c: *mut Cl, func: Func, offset: *mut u6
 /// The code ranges of `func` with their source places, sorted by offset: what the fault tables are built from.
 #[no_mangle]
 pub unsafe extern "C" fn ms_cl_func_ranges(c: *mut Cl, func: Func, n: *mut u32) -> *const ClCodeRange {
-    let info = cl(c).info.lock().unwrap();
+    let info = cl(c).run.info.lock().unwrap();
     let i = &info[func.0 as usize];
     *n = i.ranges.len() as u32;
     i.ranges.as_ptr()

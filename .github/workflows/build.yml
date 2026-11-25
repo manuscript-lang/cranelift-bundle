@@ -56,6 +56,10 @@ jobs:
             target
           key: cargo-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'patches/*', 'cranelift-version') }}
       - name: Build
+        env:
+          # Floors: glibc 2.28 (manylinux_2_28), macOS 11, Windows with a statically linked C runtime.
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+          RUSTFLAGS: ${{ matrix.os == 'windows' && '-C target-feature=+crt-static' || '' }}
         run: sh build.sh "${{ matrix.os }}" "${{ matrix.arch }}" | tee dist-summary.txt
       - name: Smoke test (load the library by path, build functions with it, link and run them)
         run: |
@@ -67,6 +71,17 @@ jobs:
                      cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
             windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll smoke.obj
                      clang smoke/main.c smoke.obj -o smoke-run.exe && ./smoke-run.exe ;;
+          esac
+      - name: Check the platform floor
+        run: |
+          case "${{ matrix.os }}" in
+            linux)   max=$(objdump -T target/release/libms_cranelift.so | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+                     echo "highest glibc symbol: $max"
+                     [ "$(printf '%s\n2.28\n' "$max" | sort -V | tail -1)" = 2.28 ] ;;
+            darwin)  otool -l target/release/libms_cranelift.dylib | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN' | tee floor.txt
+                     grep -qE 'minos 11\.0|version 11\.0' floor.txt ;;
+            windows) dumpbin //dependents target/release/ms_cranelift.dll | tee floor.txt
+                     ! grep -qiE 'vcruntime|msvcp|api-ms-win-crt|ucrtbase' floor.txt ;;
           esac
       - run: cat dist-summary.txt
       - uses: actions/upload-artifact@v4

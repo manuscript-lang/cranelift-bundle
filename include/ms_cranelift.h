@@ -23,7 +23,7 @@
  *   ms_cl_block blk = ms_cl_entry(b);
  *   ms_cl_ret1(b, ms_cl_iadd(b, ms_cl_block_param(b, blk, 0), ms_cl_block_param(b, blk, 1)));
  *   ms_cl_seal_all(b);
- *   if (ms_cl_fn_end(b) || ms_cl_define(c, b)) fail(ms_cl_error(c));   // compile (parallel-safe), then add to the module
+ *   ms_cl_fn_end(b);   // queued for the worker threads; ms_cl_finish waits
  *   size_t n; const uint8_t *object = ms_cl_finish(c, &n);   // valid until ms_cl_free
  */
 #ifndef MS_CRANELIFT_H
@@ -157,17 +157,16 @@ typedef struct { uint32_t offset, kind, target; int64_t addend; } ms_cl_reloc;
   X(void, ms_cl_dwarf_file, (ms_cl *c, uint32_t index, const char *path)) \
   X(void, ms_cl_dwarf_dir, (ms_cl *c, const char *dir)) \
   X(void, ms_cl_func_name, (ms_cl *c, ms_cl_func f, const char *name)) \
-  /* Function builders: one per thread that builds. Builders share nothing with the module while building and compiling,
-     so ms_cl_fn_end may run on several threads at once; ms_cl_define moves the compiled code into the module and must be
-     called by one thread at a time. Declare every signature, function and data object before a body mentions it. */ \
+  /* Function builders: one per thread that builds. Declare every signature, function and data object before a body
+     mentions it. ms_cl_fn_end hands the function to the module's worker threads (ms_cl_new key "ms_threads", default one
+     per core; 1 compiles on the calling thread) and returns at once, so the builder may begin its next function. */ \
   X(ms_cl_fn *, ms_cl_fn_new, (ms_cl *c)) \
   X(void, ms_cl_fn_free, (ms_cl_fn *f)) \
   X(const char *, ms_cl_fn_error, (ms_cl_fn *f)) \
   X(void, ms_cl_fn_begin, (ms_cl_fn *f, ms_cl_func func)) \
-  /* Compiles the function: 0, or 1 with the message in ms_cl_fn_error. */ \
   X(int, ms_cl_fn_end, (ms_cl_fn *f)) \
-  /* Adds the compiled function to the module: 0, or 1 with the message in ms_cl_error. f may begin the next function. */ \
-  X(int, ms_cl_define, (ms_cl *c, ms_cl_fn *f))
+  /* Waits for every queued function: 0, or 1 with the first compile error (by declaration order) in ms_cl_error. */ \
+  X(int, ms_cl_wait, (ms_cl *c))
 
 #ifdef MS_CL_DYNAMIC
 typedef struct {
@@ -237,7 +236,7 @@ extern ms_cl_api ms_cl_fns;
 #define ms_cl_fn_error ms_cl_fns.fn_ms_cl_fn_error
 #define ms_cl_fn_begin ms_cl_fns.fn_ms_cl_fn_begin
 #define ms_cl_fn_end ms_cl_fns.fn_ms_cl_fn_end
-#define ms_cl_define ms_cl_fns.fn_ms_cl_define
+#define ms_cl_wait ms_cl_fns.fn_ms_cl_wait
 
 typedef void *(*ms_cl_resolver)(void *data, const char *name);
 /* Fills the table; returns the first name the resolver could not find, or NULL. */

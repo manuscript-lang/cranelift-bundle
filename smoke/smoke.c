@@ -45,14 +45,9 @@ static ms_cl_sig sig(ms_cl_type ret, int nparams, ms_cl_type param) {
   ms_cl_sig_ret(c, s, ret, MS_CL_EXT_NONE);
   return s;
 }
-/* Compiles what f built and adds it to the module (the module step is one thread at a time). */
-static lock_t module_lock;
+/* Queues what f built; the module's workers compile it. */
 static void finish_fn(ms_cl_fn *f, const char *what) {
   if (ms_cl_fn_end(f)) { fprintf(stderr, "%s: %s\n", what, ms_cl_fn_error(f)); exit(1); }
-  LOCK(&module_lock);
-  int bad = ms_cl_define(c, f);
-  UNLOCK(&module_lock);
-  check(bad, what);
 }
 
 enum { WORKERS = 4, PER_WORKER = 16 };
@@ -81,7 +76,6 @@ int main(int argc, char **argv) {
   if (!h) { fprintf(stderr, "cannot load %s\n", argv[1]); return 1; }
   const char *missing = ms_cl_bind(resolve, h);
   if (missing) { fprintf(stderr, "missing %s\n", missing); return 1; }
-  LOCK_INIT(&module_lock);
   const char *k[] = {"opt_level", "regalloc_algorithm"}, *v[] = {"none", "single_pass"};
   c = ms_cl_new(NULL, 2, k, v);
   if (!c) { fprintf(stderr, "new: %s\n", ms_cl_error(NULL)); return 1; }
