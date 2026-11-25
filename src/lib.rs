@@ -25,7 +25,8 @@ use cranelift_object::object::write::{Relocation, StandardSegment, SymbolSection
 use cranelift_object::object::{BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use gimli::write::{
-    Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Range, RangeList, RelocateWriter,
+    Address, AttributeValue, DwarfUnit, EndianVec, Expression, LineProgram, LineString, Location, LocationList, Range,
+    RangeList, RelocateWriter,
     Relocation as DwarfRelocation, RelocationTarget, Sections,
 };
 use gimli::{Encoding, Format, LineEncoding, RunTimeEndian};
@@ -97,10 +98,37 @@ struct Decls {
 
 type Shared = Arc<RwLock<Decls>>;
 
+/// A named value for the debugger, from `cl_var`: its type is a base type of `size` bytes and DWARF `encoding`.
+#[derive(Clone)]
+struct VarDecl {
+    name: String,
+    type_name: String,
+    size: u32,
+    encoding: u32,
+    param: bool,
+    label: ir::ValueLabel,
+}
+
+/// Where a named value lives: a register (DWARF number) or a frame slot (offset from the canonical frame address).
+#[derive(Clone, Copy, PartialEq)]
+enum VarLoc {
+    Reg(u16),
+    Cfa(i64),
+}
+
+/// A named value and the code ranges (offsets from the function start) where Cranelift kept it in one place.
+struct VarInfo {
+    decl: VarDecl,
+    ranges: Vec<(u32, u32, VarLoc)>,
+}
+
 #[derive(Default)]
 struct FuncInfo {
     size: u32,
     ranges: Vec<ClCodeRange>,
+    vars: Vec<VarInfo>,
+    /// Windows unwind data (an `.xdata` record), which the system's stack walker needs for the function.
+    unwind: Option<Vec<u8>>,
     name: Option<String>,
     defined: bool,
     /// Offset in the object's text section, set by `finish`.
@@ -146,6 +174,8 @@ pub struct Fnb {
     /// The (file, line, column) of each `cl_srcloc` call; a `SourceLoc` is an index into it.
     locs: Vec<(u32, u32, u32)>,
     loc_ix: HashMap<(u32, u32, u32), u32>,
+    /// The values `cl_var` named in the current function.
+    vars: Vec<VarDecl>,
     err: CString,
     dump: CString,
 }
@@ -162,6 +192,7 @@ struct Job {
     func: u32,
     id: FuncId,
     locs: Vec<(u32, u32, u32)>,
+    vars: Vec<VarDecl>,
 }
 
 /// Compilation state shared by the module, its builders and the workers.
@@ -191,13 +222,15 @@ struct Pool {
 
 impl Run {
     fn compile(&self, job: Job) {
-        let Job { mut ctx, func, id, locs } = job;
-        match compile_ctx(&self.isa, &mut ctx, id, &locs) {
-            Ok((compiled, ranges)) => {
+        let Job { mut ctx, func, id, locs, vars } = job;
+        match compile_ctx(&self.isa, &mut ctx, id, &locs, vars) {
+            Ok((compiled, ranges, vars, unwind)) => {
                 let mut info = self.info.lock().unwrap();
                 let i = &mut info[func as usize];
                 i.size = compiled.code.len() as u32;
                 i.ranges = ranges;
+                i.vars = vars;
+                i.unwind = unwind;
                 i.defined = true;
                 drop(info);
                 self.done.lock().unwrap()[func as usize] = Some(compiled);
@@ -268,7 +301,7 @@ impl Drop for Cl {
     }
 }
 
-fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32, u32, u32)]) -> Result<(Compiled, Vec<ClCodeRange>), String> {
+fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32, u32, u32)], decls: Vec<VarDecl>) -> Result<(Compiled, Vec<ClCodeRange>, Vec<VarInfo>, Option<Vec<u8>>), String> {
     // A Cranelift bug panics; report it as this function's error so the caller can fall back instead of dying.
     let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.compile(&**isa, &mut ControlPlane::default()).map(|_| ()).map_err(|e| format!("{e:?}"))));
     match compiled {
@@ -286,7 +319,68 @@ fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32
         ranges.push(ClCodeRange { off: r.start, end: r.end.min(size), file, line, column });
     }
     let relocs = cc.buffer.relocs().iter().map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id)).collect();
-    Ok((Compiled { code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs }, ranges))
+    let vars = decls.into_iter().map(|decl| var_info(isa, cc, decl)).collect();
+    let unwind = windows_unwind(isa, cc, size)?;
+    Ok((Compiled { code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs }, ranges, vars, unwind))
+}
+
+/// The `.xdata` record of a function on Windows, where the system's stack walker finds frames only through unwind data
+/// (none elsewhere: the frame-pointer chain and the DWARF tables serve there).
+fn windows_unwind(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, size: u32) -> Result<Option<Vec<u8>>, String> {
+    use cranelift_codegen::isa::unwind::UnwindInfo;
+    if isa.triple().operating_system != target_lexicon::OperatingSystem::Windows {
+        return Ok(None);
+    }
+    match cc.create_unwind_info(&**isa).map_err(|e| format!("unwind info: {e:?}"))? {
+        Some(UnwindInfo::WindowsX64(info)) => {
+            let mut bytes = vec![0u8; info.emit_size()];
+            info.emit(&mut bytes);
+            Ok(Some(bytes))
+        }
+        Some(UnwindInfo::WindowsArm64(info)) => {
+            // One header word, then the codes, with the epilogue taken to repeat them (E=1, from code 0).
+            let words = u32::from(info.code_words());
+            if words > 31 || size / 4 >= 1 << 18 {
+                return Err("function too large for compact Windows unwind data".to_string());
+            }
+            let mut codes = vec![0u8; words as usize * 4];
+            info.emit(&mut codes);
+            let header = size / 4 | 1 << 21 | words << 27;
+            let mut bytes = header.to_le_bytes().to_vec();
+            bytes.extend(codes);
+            Ok(Some(bytes))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The places Cranelift tracked for a variable's label, in code order, with neighbours that stay put joined (it splits
+/// a range at every block).
+fn var_info(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, decl: VarDecl) -> VarInfo {
+    let mut found: Vec<(u32, u32, VarLoc)> = cc
+        .value_labels_ranges
+        .get(&decl.label)
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| {
+                    let loc = match r.loc {
+                        cranelift_codegen::LabelValueLoc::Reg(reg) => VarLoc::Reg(isa.map_regalloc_reg_to_dwarf(reg).ok()?),
+                        cranelift_codegen::LabelValueLoc::CFAOffset(o) => VarLoc::Cfa(o),
+                    };
+                    Some((r.start, r.end, loc))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort_by_key(|r| r.0);
+    let mut ranges: Vec<(u32, u32, VarLoc)> = Vec::new();
+    for r in found {
+        match ranges.last_mut() {
+            Some(last) if last.1 == r.0 && last.2 == r.2 => last.1 = r.1,
+            _ => ranges.push(r),
+        }
+    }
+    VarInfo { decl, ranges }
 }
 
 fn cl<'a>(c: *mut Cl) -> &'a mut Cl {
@@ -404,7 +498,7 @@ pub unsafe extern "C" fn cl_new(triple: *const c_char, n: u32, keys: *const *con
         let mut set = |k: &str, v: &str| flags.set(k, v).map_err(|e| format!("setting {k}={v}: {e}"));
         set("opt_level", "none")?;
         set("is_pic", if arm64_coff { "false" } else { "true" })?;
-        set("unwind_info", "false")?;
+        set("unwind_info", if triple.operating_system == target_lexicon::OperatingSystem::Windows { "true" } else { "false" })?;
         set("enable_verifier", "false")?;
         set("preserve_frame_pointers", "true")?;
         set("enable_multi_ret_implicit_sret", "true")?;
@@ -594,6 +688,7 @@ pub unsafe extern "C" fn cl_fn_new(c: *mut Cl) -> *mut Fnb {
         grefs: HashMap::new(),
         srefs: HashMap::new(),
         locs: vec![],
+        vars: vec![],
         loc_ix: HashMap::new(),
         err: CString::default(),
         dump: CString::default(),
@@ -635,6 +730,7 @@ pub unsafe extern "C" fn cl_fn_begin(f: *mut Fnb, func: Func) {
     c.grefs.clear();
     c.srefs.clear();
     c.locs.clear();
+    c.vars.clear();
     c.loc_ix.clear();
     // The builder borrows the context and the function for as long as the body is built.
     let func_ref: &'static mut ir::Function = std::mem::transmute(&mut c.ctx.func);
@@ -657,6 +753,20 @@ pub unsafe extern "C" fn cl_srcloc(f: *mut Fnb, file: u32, line: u32, column: u3
         }
     };
     bld(c).set_srcloc(SourceLoc::new(ix));
+}
+
+/// Names `value` for the debugger: it is shown as `name`, of a base type called `type_name` of `size` bytes and DWARF
+/// base-type `encoding` (for example `DW_ATE_signed`), a parameter when `param` is not 0. The value is described where
+/// the code keeps it, so it must stay live in the code that follows. At most one name per value.
+#[no_mangle]
+pub unsafe extern "C" fn cl_var(f: *mut Fnb, value: Val, name: *const c_char, type_name: *const c_char, size: u32, encoding: u32, param: i32) {
+    let c = fb(f);
+    let label = ir::ValueLabel::from_u32(c.vars.len() as u32);
+    let v = val(c, value);
+    bld(c).func.stencil.dfg.collect_debug_info();
+    bld(c).set_val_label(v, label);
+    let text = |p: *const c_char| CStr::from_ptr(p).to_string_lossy().into_owned();
+    c.vars.push(VarDecl { name: text(name), type_name: text(type_name), size, encoding, param: param != 0, label });
 }
 
 fn fref(c: &mut Fnb, func: Func) -> FuncRef {
@@ -772,7 +882,8 @@ pub unsafe extern "C" fn cl_fn_end(f: *mut Fnb) -> i32 {
     let fresh = c.run.spare.lock().unwrap().pop().unwrap_or_else(Context::new);
     let ctx = std::mem::replace(&mut c.ctx, fresh);
     let locs = std::mem::take(&mut c.locs);
-    c.run.submit(Job { ctx, func, id, locs });
+    let vars = std::mem::take(&mut c.vars);
+    c.run.submit(Job { ctx, func, id, locs, vars });
     0
 }
 
@@ -1298,6 +1409,7 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
     dwarf.unit.get_mut(root).set(gimli::DW_AT_producer, AttributeValue::String(b"Cranelift".to_vec()));
     let mut symbols = Vec::new();
     let mut ranges = Vec::new();
+    let mut types: HashMap<(String, u32, u32), gimli::write::UnitEntryId> = HashMap::new();
     let infos = c.run.info.lock().unwrap();
     for (i, info) in infos.iter().enumerate() {
         if !info.defined || info.ranges.is_empty() {
@@ -1312,6 +1424,45 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
         dwarf.unit.get_mut(entry).set(gimli::DW_AT_name, AttributeValue::String(name.into_bytes()));
         dwarf.unit.get_mut(entry).set(gimli::DW_AT_low_pc, AttributeValue::Address(address));
         dwarf.unit.get_mut(entry).set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(info.size)));
+        let mut frame = Expression::new();
+        frame.op(gimli::DW_OP_call_frame_cfa);
+        dwarf.unit.get_mut(entry).set(gimli::DW_AT_frame_base, AttributeValue::Exprloc(frame));
+        for v in &info.vars {
+            let key = (v.decl.type_name.clone(), v.decl.size, v.decl.encoding);
+            let ty = *types.entry(key).or_insert_with(|| {
+                let t = dwarf.unit.add(root, gimli::DW_TAG_base_type);
+                let die = dwarf.unit.get_mut(t);
+                die.set(gimli::DW_AT_name, AttributeValue::String(v.decl.type_name.clone().into_bytes()));
+                die.set(gimli::DW_AT_byte_size, AttributeValue::Udata(u64::from(v.decl.size)));
+                die.set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DwAte(v.decl.encoding as u8)));
+                t
+            });
+            let locations: Vec<Location> = v
+                .ranges
+                .iter()
+                .filter(|r| r.0 < r.1 && r.1 <= info.size)
+                .map(|&(begin, end, loc)| {
+                    let mut expr = Expression::new();
+                    match loc {
+                        VarLoc::Reg(r) => expr.op_reg(gimli::Register(r)),
+                        VarLoc::Cfa(o) => expr.op_fbreg(o),
+                    }
+                    Location::StartEnd {
+                        begin: Address::Symbol { symbol, addend: i64::from(begin) },
+                        end: Address::Symbol { symbol, addend: i64::from(end) },
+                        data: expr,
+                    }
+                })
+                .collect();
+            let tag = if v.decl.param { gimli::DW_TAG_formal_parameter } else { gimli::DW_TAG_variable };
+            let var = dwarf.unit.add(entry, tag);
+            dwarf.unit.get_mut(var).set(gimli::DW_AT_name, AttributeValue::String(v.decl.name.clone().into_bytes()));
+            dwarf.unit.get_mut(var).set(gimli::DW_AT_type, AttributeValue::UnitRef(ty));
+            if !locations.is_empty() {
+                let list = dwarf.unit.locations.add(LocationList(locations));
+                dwarf.unit.get_mut(var).set(gimli::DW_AT_location, AttributeValue::LocationListRef(list));
+            }
+        }
         let mut end = None;
         for r in &info.ranges {
             let Some(file) = files.get(&r.file) else { continue };
@@ -1390,6 +1541,52 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
     })
 }
 
+/// Writes `.xdata` (each function's unwind record) and `.pdata` (the table mapping code ranges to records) for COFF
+/// objects, with image-relative relocations the linker resolves.
+fn emit_unwind(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(), String> {
+    if product.object.format() != BinaryFormat::Coff {
+        return Ok(());
+    }
+    let arm64 = matches!(c.isa.triple().architecture, target_lexicon::Architecture::Aarch64(_));
+    let infos = c.run.info.lock().unwrap();
+    let (mut xdata, mut pdata) = (Vec::new(), Vec::new());
+    let mut entries = Vec::new();
+    for (i, info) in infos.iter().enumerate() {
+        let Some(bytes) = info.unwind.as_ref().filter(|_| info.defined) else { continue };
+        while xdata.len() % 4 != 0 {
+            xdata.push(0);
+        }
+        entries.push((i, xdata.len() as i64, u64::from(info.size)));
+        xdata.extend_from_slice(bytes);
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let stride = if arm64 { 8 } else { 12 };
+    pdata.resize(entries.len() * stride, 0);
+    let x = product.object.add_section(Vec::new(), b".xdata".to_vec(), SectionKind::ReadOnlyData);
+    product.object.section_mut(x).set_data(xdata, 4);
+    let p = product.object.add_section(Vec::new(), b".pdata".to_vec(), SectionKind::ReadOnlyData);
+    product.object.section_mut(p).set_data(pdata, 4);
+    let x_symbol = product.object.section_symbol(x);
+    let image_offset = |size| RelocationFlags::Generic { kind: RelocationKind::ImageOffset, encoding: RelocationEncoding::Generic, size };
+    for (n, &(i, at, size)) in entries.iter().enumerate() {
+        let row = (n * stride) as u64;
+        let function = product.function_symbol(ids[i]);
+        let mut relocs = vec![(row, function, 0, image_offset(32))];
+        if arm64 {
+            relocs.push((row + 4, x_symbol, at, image_offset(32)));
+        } else {
+            relocs.push((row + 4, function, size as i64, image_offset(32)));
+            relocs.push((row + 8, x_symbol, at, image_offset(32)));
+        }
+        for (offset, symbol, addend, flags) in relocs {
+            product.object.add_relocation(p, Relocation { offset, symbol, addend, flags }).map_err(|e| format!("unwind relocation: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn finish(c: &mut Cl) -> Result<Vec<u8>, String> {
     let ids: Vec<FuncId> = c.decls.read().unwrap().funcs.iter().map(|f| f.id).collect();
     let data_ids: Vec<DataId> = c.decls.read().unwrap().datas.iter().map(|d| d.id).collect();
@@ -1428,6 +1625,7 @@ fn finish(c: &mut Cl) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("relocation: {e}"))?;
     }
     emit_dwarf(c, &mut product, &ids)?;
+    emit_unwind(c, &mut product, &ids)?;
     product.emit().map_err(|e| e.to_string())
 }
 
