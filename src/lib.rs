@@ -338,9 +338,10 @@ fn windows_unwind(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, si
             Ok(Some(bytes))
         }
         Some(UnwindInfo::WindowsArm64(info)) => {
-            // One header word, then the codes, with the epilogue taken to repeat them (E=1, from code 0). Cranelift
-            // does not write the end code (0xE4) the unwinder stops at: a final word of it follows the codes, whose
-            // zero padding is harmless no-op allocations.
+            // One header word, then the codes, with no epilogue scopes: an unwinder that was told of one takes the
+            // function's last instructions for it, and Cranelift puts cold blocks that call the fault helpers
+            // there, so a frame's caller was lost. Cranelift does not write the end code (0xE4) the unwinder
+            // stops at: a final word of it follows the codes, whose zero padding is harmless no-op allocations.
             let words = u32::from(info.code_words()) + 1;
             if words > 31 || size / 4 >= 1 << 18 {
                 return Err("function too large for compact Windows unwind data".to_string());
@@ -348,7 +349,7 @@ fn windows_unwind(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, si
             let mut codes = vec![0u8; words as usize * 4];
             info.emit(&mut codes[..words as usize * 4 - 4]);
             codes[words as usize * 4 - 4] = 0xE4;
-            let header = size / 4 | 1 << 21 | words << 27;
+            let header = size / 4 | words << 27;
             let mut bytes = header.to_le_bytes().to_vec();
             bytes.extend(codes);
             Ok(Some(bytes))
