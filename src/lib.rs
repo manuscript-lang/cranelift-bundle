@@ -21,7 +21,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
-use cranelift_object::object::write::{Relocation, StandardSegment, SymbolSection};
+use cranelift_object::object::write::{Relocation, SectionId, StandardSegment, SymbolId, SymbolSection};
 use cranelift_object::object::{BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use gimli::write::{
@@ -338,13 +338,16 @@ fn windows_unwind(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, si
             Ok(Some(bytes))
         }
         Some(UnwindInfo::WindowsArm64(info)) => {
-            // One header word, then the codes, with the epilogue taken to repeat them (E=1, from code 0).
-            let words = u32::from(info.code_words());
+            // One header word, then the codes, with the epilogue taken to repeat them (E=1, from code 0). Cranelift
+            // does not write the end code (0xE4) the unwinder stops at: a final word of it follows the codes, whose
+            // zero padding is harmless no-op allocations.
+            let words = u32::from(info.code_words()) + 1;
             if words > 31 || size / 4 >= 1 << 18 {
                 return Err("function too large for compact Windows unwind data".to_string());
             }
             let mut codes = vec![0u8; words as usize * 4];
-            info.emit(&mut codes);
+            info.emit(&mut codes[..words as usize * 4 - 4]);
+            codes[words as usize * 4 - 4] = 0xE4;
             let header = size / 4 | 1 << 21 | words << 27;
             let mut bytes = header.to_le_bytes().to_vec();
             bytes.extend(codes);
@@ -1386,6 +1389,23 @@ impl RelocateWriter for Section {
     }
 }
 
+/// The address each function's section will have in a Mach-O object. The object lays its sections out in order
+/// from zero and the debug sections added after these do not move them, so a trial write tells.
+fn section_addresses(product: &ObjectProduct, symbols: &[SymbolId]) -> Result<HashMap<SectionId, u64>, String> {
+    use cranelift_object::object::{Object, ObjectSection};
+    let bytes = product.object.write().map_err(|e| format!("object: {e}"))?;
+    let file = cranelift_object::object::File::parse(&*bytes).map_err(|e| format!("object: {e}"))?;
+    let mut found = HashMap::new();
+    for &symbol in symbols {
+        let Some(id) = product.object.symbol(symbol).section.id() else { continue };
+        let Some(name) = product.object.section(id).name() else { continue };
+        if let Some(section) = file.sections().find(|s| s.name().ok() == Some(name)) {
+            found.insert(id, section.address());
+        }
+    }
+    Ok(found)
+}
+
 /// Writes the line table (DWARF 4, a compile unit with a subprogram per function) into the object, with relocations
 /// against the function symbols. A row's column is the value given to `cl_srcloc`.
 fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(), String> {
@@ -1501,6 +1521,27 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
     dwarf.write(&mut sections).map_err(|e| format!("DWARF: {e}"))?;
     let format = product.object.format();
     let mut sec_ids = HashMap::new();
+    // Mach-O DWARF sections refer to one another by plain offsets, with no relocation (llvm-mc writes them
+    // so), and dsymutil rewrites them; only addresses of code carry relocations.
+    if format == BinaryFormat::MachO {
+        sections.for_each_mut(|_, s| -> Result<(), String> {
+            let mut kept = Vec::new();
+            for r in std::mem::take(&mut s.relocations) {
+                if !matches!(r.target, RelocationTarget::Section(_)) {
+                    kept.push(r);
+                    continue;
+                }
+                let at = r.offset as usize;
+                let bytes = s.bytes.slice().get(at..at + r.size as usize).ok_or("DWARF offset is outside its section")?;
+                let mut value = [0u8; 8];
+                value[..bytes.len()].copy_from_slice(bytes);
+                let value = u64::from_le_bytes(value).wrapping_add(r.addend as u64);
+                gimli::write::Writer::write_at(&mut s.bytes, at, &value.to_le_bytes()[..r.size as usize]).map_err(|e| format!("DWARF: {e}"))?;
+            }
+            s.relocations = kept;
+            Ok(())
+        })?;
+    }
     sections.for_each(|id, s| -> Result<(), String> {
         if s.bytes.slice().is_empty() {
             return Ok(());
@@ -1512,16 +1553,19 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
         sec_ids.insert(id, section);
         Ok(())
     })?;
+    let bases = if format == BinaryFormat::MachO { section_addresses(product, &symbols)? } else { HashMap::new() };
     sections.for_each(|id, s| -> Result<(), String> {
         let Some(&section) = sec_ids.get(&id) else { return Ok(()) };
         for r in &s.relocations {
             let (symbol, kind, addend) = match r.target {
                 RelocationTarget::Symbol(i) if format == BinaryFormat::MachO => {
-                    // Mach-O DWARF consumers read section-relative addresses before linking: use a section
-                    // relocation and the function's offset, as llvm-mc does.
+                    // A Mach-O object holds the object-relative address of a function (its section's address
+                    // plus its offset) with a relocation against the section, as llvm-mc writes it, which is
+                    // what dsymutil matches against the debug map.
                     let function = product.object.symbol(symbols[i]);
                     let sec = function.section.id().ok_or("DWARF function is not defined in a section")?;
-                    let offset = i64::try_from(function.value).ok().and_then(|v| v.checked_add(r.addend)).ok_or("DWARF function offset is too large")?;
+                    let base = *bases.get(&sec).ok_or("DWARF function section has no address")?;
+                    let offset = i64::try_from(function.value + base).ok().and_then(|v| v.checked_add(r.addend)).ok_or("DWARF function offset is too large")?;
                     (product.object.section_symbol(sec), RelocationKind::Absolute, offset)
                 }
                 RelocationTarget::Symbol(i) => (symbols[i], RelocationKind::Absolute, r.addend),
