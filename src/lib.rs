@@ -25,7 +25,8 @@ use cranelift_object::object::write::{Relocation, StandardSegment, SymbolSection
 use cranelift_object::object::{BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use gimli::write::{
-    Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Range, RangeList, RelocateWriter,
+    Address, AttributeValue, DwarfUnit, EndianVec, Expression, LineProgram, LineString, Location, LocationList, Range,
+    RangeList, RelocateWriter,
     Relocation as DwarfRelocation, RelocationTarget, Sections,
 };
 use gimli::{Encoding, Format, LineEncoding, RunTimeEndian};
@@ -97,10 +98,35 @@ struct Decls {
 
 type Shared = Arc<RwLock<Decls>>;
 
+/// A named value for the debugger, from `cl_var`: its type is a base type of `size` bytes and DWARF `encoding`.
+#[derive(Clone)]
+struct VarDecl {
+    name: String,
+    type_name: String,
+    size: u32,
+    encoding: u32,
+    param: bool,
+    label: ir::ValueLabel,
+}
+
+/// Where a named value lives: a register (DWARF number) or a frame slot (offset from the canonical frame address).
+#[derive(Clone, Copy, PartialEq)]
+enum VarLoc {
+    Reg(u16),
+    Cfa(i64),
+}
+
+/// A named value and the code ranges (offsets from the function start) where Cranelift kept it in one place.
+struct VarInfo {
+    decl: VarDecl,
+    ranges: Vec<(u32, u32, VarLoc)>,
+}
+
 #[derive(Default)]
 struct FuncInfo {
     size: u32,
     ranges: Vec<ClCodeRange>,
+    vars: Vec<VarInfo>,
     name: Option<String>,
     defined: bool,
     /// Offset in the object's text section, set by `finish`.
@@ -146,6 +172,8 @@ pub struct Fnb {
     /// The (file, line, column) of each `cl_srcloc` call; a `SourceLoc` is an index into it.
     locs: Vec<(u32, u32, u32)>,
     loc_ix: HashMap<(u32, u32, u32), u32>,
+    /// The values `cl_var` named in the current function.
+    vars: Vec<VarDecl>,
     err: CString,
     dump: CString,
 }
@@ -162,6 +190,7 @@ struct Job {
     func: u32,
     id: FuncId,
     locs: Vec<(u32, u32, u32)>,
+    vars: Vec<VarDecl>,
 }
 
 /// Compilation state shared by the module, its builders and the workers.
@@ -191,13 +220,14 @@ struct Pool {
 
 impl Run {
     fn compile(&self, job: Job) {
-        let Job { mut ctx, func, id, locs } = job;
-        match compile_ctx(&self.isa, &mut ctx, id, &locs) {
-            Ok((compiled, ranges)) => {
+        let Job { mut ctx, func, id, locs, vars } = job;
+        match compile_ctx(&self.isa, &mut ctx, id, &locs, vars) {
+            Ok((compiled, ranges, vars)) => {
                 let mut info = self.info.lock().unwrap();
                 let i = &mut info[func as usize];
                 i.size = compiled.code.len() as u32;
                 i.ranges = ranges;
+                i.vars = vars;
                 i.defined = true;
                 drop(info);
                 self.done.lock().unwrap()[func as usize] = Some(compiled);
@@ -268,7 +298,7 @@ impl Drop for Cl {
     }
 }
 
-fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32, u32, u32)]) -> Result<(Compiled, Vec<ClCodeRange>), String> {
+fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32, u32, u32)], decls: Vec<VarDecl>) -> Result<(Compiled, Vec<ClCodeRange>, Vec<VarInfo>), String> {
     // A Cranelift bug panics; report it as this function's error so the caller can fall back instead of dying.
     let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.compile(&**isa, &mut ControlPlane::default()).map(|_| ()).map_err(|e| format!("{e:?}"))));
     match compiled {
@@ -286,7 +316,37 @@ fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32
         ranges.push(ClCodeRange { off: r.start, end: r.end.min(size), file, line, column });
     }
     let relocs = cc.buffer.relocs().iter().map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id)).collect();
-    Ok((Compiled { code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs }, ranges))
+    let vars = decls.into_iter().map(|decl| var_info(isa, cc, decl)).collect();
+    Ok((Compiled { code: cc.code_buffer().to_vec(), align: cc.buffer.alignment as u64, relocs }, ranges, vars))
+}
+
+/// The places Cranelift tracked for a variable's label, in code order, with neighbours that stay put joined (it splits
+/// a range at every block).
+fn var_info(isa: &OwnedTargetIsa, cc: &cranelift_codegen::CompiledCode, decl: VarDecl) -> VarInfo {
+    let mut found: Vec<(u32, u32, VarLoc)> = cc
+        .value_labels_ranges
+        .get(&decl.label)
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| {
+                    let loc = match r.loc {
+                        cranelift_codegen::LabelValueLoc::Reg(reg) => VarLoc::Reg(isa.map_regalloc_reg_to_dwarf(reg).ok()?),
+                        cranelift_codegen::LabelValueLoc::CFAOffset(o) => VarLoc::Cfa(o),
+                    };
+                    Some((r.start, r.end, loc))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort_by_key(|r| r.0);
+    let mut ranges: Vec<(u32, u32, VarLoc)> = Vec::new();
+    for r in found {
+        match ranges.last_mut() {
+            Some(last) if last.1 == r.0 && last.2 == r.2 => last.1 = r.1,
+            _ => ranges.push(r),
+        }
+    }
+    VarInfo { decl, ranges }
 }
 
 fn cl<'a>(c: *mut Cl) -> &'a mut Cl {
@@ -594,6 +654,7 @@ pub unsafe extern "C" fn cl_fn_new(c: *mut Cl) -> *mut Fnb {
         grefs: HashMap::new(),
         srefs: HashMap::new(),
         locs: vec![],
+        vars: vec![],
         loc_ix: HashMap::new(),
         err: CString::default(),
         dump: CString::default(),
@@ -635,6 +696,7 @@ pub unsafe extern "C" fn cl_fn_begin(f: *mut Fnb, func: Func) {
     c.grefs.clear();
     c.srefs.clear();
     c.locs.clear();
+    c.vars.clear();
     c.loc_ix.clear();
     // The builder borrows the context and the function for as long as the body is built.
     let func_ref: &'static mut ir::Function = std::mem::transmute(&mut c.ctx.func);
@@ -657,6 +719,20 @@ pub unsafe extern "C" fn cl_srcloc(f: *mut Fnb, file: u32, line: u32, column: u3
         }
     };
     bld(c).set_srcloc(SourceLoc::new(ix));
+}
+
+/// Names `value` for the debugger: it is shown as `name`, of a base type called `type_name` of `size` bytes and DWARF
+/// base-type `encoding` (for example `DW_ATE_signed`), a parameter when `param` is not 0. The value is described where
+/// the code keeps it, so it must stay live in the code that follows. At most one name per value.
+#[no_mangle]
+pub unsafe extern "C" fn cl_var(f: *mut Fnb, value: Val, name: *const c_char, type_name: *const c_char, size: u32, encoding: u32, param: i32) {
+    let c = fb(f);
+    let label = ir::ValueLabel::from_u32(c.vars.len() as u32);
+    let v = val(c, value);
+    bld(c).func.stencil.dfg.collect_debug_info();
+    bld(c).set_val_label(v, label);
+    let text = |p: *const c_char| CStr::from_ptr(p).to_string_lossy().into_owned();
+    c.vars.push(VarDecl { name: text(name), type_name: text(type_name), size, encoding, param: param != 0, label });
 }
 
 fn fref(c: &mut Fnb, func: Func) -> FuncRef {
@@ -772,7 +848,8 @@ pub unsafe extern "C" fn cl_fn_end(f: *mut Fnb) -> i32 {
     let fresh = c.run.spare.lock().unwrap().pop().unwrap_or_else(Context::new);
     let ctx = std::mem::replace(&mut c.ctx, fresh);
     let locs = std::mem::take(&mut c.locs);
-    c.run.submit(Job { ctx, func, id, locs });
+    let vars = std::mem::take(&mut c.vars);
+    c.run.submit(Job { ctx, func, id, locs, vars });
     0
 }
 
@@ -1298,6 +1375,7 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
     dwarf.unit.get_mut(root).set(gimli::DW_AT_producer, AttributeValue::String(b"Cranelift".to_vec()));
     let mut symbols = Vec::new();
     let mut ranges = Vec::new();
+    let mut types: HashMap<(String, u32, u32), gimli::write::UnitEntryId> = HashMap::new();
     let infos = c.run.info.lock().unwrap();
     for (i, info) in infos.iter().enumerate() {
         if !info.defined || info.ranges.is_empty() {
@@ -1312,6 +1390,45 @@ fn emit_dwarf(c: &Cl, product: &mut ObjectProduct, ids: &[FuncId]) -> Result<(),
         dwarf.unit.get_mut(entry).set(gimli::DW_AT_name, AttributeValue::String(name.into_bytes()));
         dwarf.unit.get_mut(entry).set(gimli::DW_AT_low_pc, AttributeValue::Address(address));
         dwarf.unit.get_mut(entry).set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(info.size)));
+        let mut frame = Expression::new();
+        frame.op(gimli::DW_OP_call_frame_cfa);
+        dwarf.unit.get_mut(entry).set(gimli::DW_AT_frame_base, AttributeValue::Exprloc(frame));
+        for v in &info.vars {
+            let key = (v.decl.type_name.clone(), v.decl.size, v.decl.encoding);
+            let ty = *types.entry(key).or_insert_with(|| {
+                let t = dwarf.unit.add(root, gimli::DW_TAG_base_type);
+                let die = dwarf.unit.get_mut(t);
+                die.set(gimli::DW_AT_name, AttributeValue::String(v.decl.type_name.clone().into_bytes()));
+                die.set(gimli::DW_AT_byte_size, AttributeValue::Udata(u64::from(v.decl.size)));
+                die.set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DwAte(v.decl.encoding as u8)));
+                t
+            });
+            let locations: Vec<Location> = v
+                .ranges
+                .iter()
+                .filter(|r| r.0 < r.1 && r.1 <= info.size)
+                .map(|&(begin, end, loc)| {
+                    let mut expr = Expression::new();
+                    match loc {
+                        VarLoc::Reg(r) => expr.op_reg(gimli::Register(r)),
+                        VarLoc::Cfa(o) => expr.op_fbreg(o),
+                    }
+                    Location::StartEnd {
+                        begin: Address::Symbol { symbol, addend: i64::from(begin) },
+                        end: Address::Symbol { symbol, addend: i64::from(end) },
+                        data: expr,
+                    }
+                })
+                .collect();
+            let tag = if v.decl.param { gimli::DW_TAG_formal_parameter } else { gimli::DW_TAG_variable };
+            let var = dwarf.unit.add(entry, tag);
+            dwarf.unit.get_mut(var).set(gimli::DW_AT_name, AttributeValue::String(v.decl.name.clone().into_bytes()));
+            dwarf.unit.get_mut(var).set(gimli::DW_AT_type, AttributeValue::UnitRef(ty));
+            if !locations.is_empty() {
+                let list = dwarf.unit.locations.add(LocationList(locations));
+                dwarf.unit.get_mut(var).set(gimli::DW_AT_location, AttributeValue::LocationListRef(list));
+            }
+        }
         let mut end = None;
         for r in &info.ranges {
             let Some(file) = files.get(&r.file) else { continue };
