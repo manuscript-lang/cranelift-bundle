@@ -45,6 +45,9 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - name: Check the C header is generated from lib.rs
+        if: matrix.os == 'darwin' && matrix.arch == 'arm64'
+        run: python3 gen-header.py --check
       - name: Install Rust
         run: |
           if [ "$RUNNER_OS" = Windows ]; then

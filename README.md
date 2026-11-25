@@ -17,7 +17,7 @@ Consumers verify a download against a checksum **pinned in their own repository*
 
 ## Using it
 
-`include/ms_cranelift.h` documents the whole API. Handles are distinct struct types, every op has a name (`ms_cl_iadd`, `ms_cl_sqrt`, ...) or an enum for the generic call, and the same code links against the library or loads it at run time (`MS_CL_DYNAMIC`, then `ms_cl_bind` with `dlsym` or `GetProcAddress`):
+`include/ms_cranelift.h` documents the whole API. It is generated: the function list, types and doc comments come from the `extern "C"` functions of `src/lib.rs`, the typedefs, enums and conveniences from `include/ms_cranelift.h.in`; run `python3 gen-header.py` after changing either (CI runs it with `--check`). Handles are distinct struct types, every op has a name (`ms_cl_iadd`, `ms_cl_sqrt`, ...) or an enum for the generic call, and the same code links against the library or loads it at run time (`MS_CL_DYNAMIC`, then `ms_cl_bind` with `dlsym` or `GetProcAddress`):
 
 ```c
 ms_cl *c = ms_cl_new(NULL, 0, NULL, NULL);                 // host target, default options
