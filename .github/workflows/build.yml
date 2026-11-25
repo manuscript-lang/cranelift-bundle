@@ -1,0 +1,113 @@
+name: Build
+
+# Builds the shared Cranelift library on a native runner of each of six platforms and smoke-tests it by loading it from C.
+# Pushing a tag `cranelift-<version>-r<revision>` that matches cranelift-version attaches the tarballs and a SHA256SUMS file
+# to the release of the same name (created if missing). Pull requests and manual runs only build.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['cranelift-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    # Linux builds in AlmaLinux 8 (glibc 2.28) so the library loads on every glibc from 2.28 on.
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: ubuntu-24.04, container: 'quay.io/pypa/manylinux_2_28_x86_64' }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, container: 'quay.io/pypa/manylinux_2_28_aarch64' }
+          - { os: darwin, arch: amd64, runner: macos-15-intel }
+          - { os: darwin, arch: arm64, runner: macos-15 }
+          - { os: windows, arch: amd64, runner: windows-2025 }
+          - { os: windows, arch: arm64, runner: windows-11-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            target=$([ "${{ matrix.arch }}" = arm64 ] && echo aarch64-pc-windows-msvc || echo x86_64-pc-windows-msvc)
+            curl -sSf -o rustup-init.exe https://win.rustup.rs/ && ./rustup-init.exe -y --profile minimal --default-host "$target"
+          else
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'patches/*', 'cranelift-version') }}
+      - name: Build
+        env:
+          # llvm-bundle's floors: macOS 12.0 and a statically linked Windows C runtime (its MultiThreaded).
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+          RUSTFLAGS: ${{ matrix.os == 'windows' && '-C target-feature=+crt-static' || '' }}
+        run: sh build.sh "${{ matrix.os }}" "${{ matrix.arch }}" | tee dist-summary.txt
+      - name: Smoke test (load the library by path, build functions with it, link and run them)
+        run: |
+          case "${{ matrix.os }}" in
+            linux)   cc smoke/smoke.c -ldl -lpthread -o smoke-test && ./smoke-test target/release/libms_cranelift.so smoke.o
+                     cc smoke/main.c smoke.o -o smoke-run && ./smoke-run
+                     readelf --debug-dump=decodedline smoke.o > lines.txt && grep -q 'smoke.ms *42' lines.txt ;;
+            darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib smoke.o
+                     cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
+            windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll smoke.obj
+                     clang smoke/main.c smoke.obj -o smoke-run.exe && ./smoke-run.exe ;;
+          esac
+      - name: Check the platform floor
+        # The floors llvm-bundle holds: glibc 2.28 (manuscript's own script), macOS 12.0, a static Windows C runtime.
+        run: |
+          case "${{ matrix.os }}" in
+            linux)   sh check-glibc-floor.sh target/release/libms_cranelift.so ;;
+            darwin)  minos=$(otool -l target/release/libms_cranelift.dylib | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
+                     echo "macOS minos: $minos"
+                     case "$minos" in 12.0 | 11.* | 10.*) ;; *) echo "needs macOS $minos, above the 12.0 floor" >&2; exit 1 ;; esac ;;
+            windows) llvm-objdump -p target/release/ms_cranelift.dll | grep 'DLL Name' | tee floor.txt
+                     ! grep -qiE 'vcruntime|msvcp|api-ms-win-crt|ucrtbase' floor.txt ;;
+          esac
+      - run: cat dist-summary.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/cranelift-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(tr -d '[:space:]' < cranelift-version)
+          case "$TAG" in "cranelift-$version-r"*) ;; *) echo "tag $TAG does not match cranelift-version $version" >&2; exit 1 ;; esac
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Cranelift $version shared library for Manuscript, one per platform. Verify downloads against checksums pinned in the consumer."
+          cd assets && cat -- *.sha256 | sort -k2 > SHA256SUMS && cd ..
+          gh release upload "$TAG" --clobber assets/*
