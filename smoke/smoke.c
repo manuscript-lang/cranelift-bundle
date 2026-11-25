@@ -195,6 +195,8 @@ int main(int argc, char **argv) {
 
   for (int w = 0; w < WORKERS; w++) join(t[w]);
 
+  /* ranges exist once the workers are done */
+  check(ms_cl_wait(c), "compile");
   /* the places recorded for ms_checked: line 42 (scope 3) comes first, line 44 sits after the cold block */
   uint32_t nr = 0;
   const ms_cl_code_range *rs = ms_cl_func_ranges(c, f_chk, &nr);

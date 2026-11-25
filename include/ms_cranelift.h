@@ -165,7 +165,7 @@ typedef struct { uint32_t offset, kind, target; int64_t addend; } ms_cl_reloc;
   X(const char *, ms_cl_fn_error, (ms_cl_fn *f)) \
   X(void, ms_cl_fn_begin, (ms_cl_fn *f, ms_cl_func func)) \
   X(int, ms_cl_fn_end, (ms_cl_fn *f)) \
-  /* Waits for every queued function: 0, or 1 with the first compile error (by declaration order) in ms_cl_error. */ \
+  /* Waits for every queued function (ms_cl_func_info and ms_cl_func_ranges are valid after this): 0, or 1 with the first compile error (by declaration order) in ms_cl_error. */ \
   X(int, ms_cl_wait, (ms_cl *c))
 
 #ifdef MS_CL_DYNAMIC
