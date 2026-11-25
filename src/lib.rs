@@ -609,7 +609,10 @@ pub unsafe extern "C" fn ms_cl_fn_error(f: *mut Fnb) -> *const c_char {
 #[no_mangle]
 pub unsafe extern "C" fn ms_cl_fn_begin(f: *mut Fnb, func: Func) {
     let c = fb(f);
-    c.builder = None;
+    if c.builder.take().is_some() {
+        // A function abandoned half built leaves its blocks in the SSA state.
+        c.fctx = FunctionBuilderContext::new();
+    }
     c.ctx.clear();
     {
         let d = c.decls.read().unwrap();
