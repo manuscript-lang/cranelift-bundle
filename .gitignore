@@ -1,3 +1,5 @@
 target/
 dist/
 vendor/
+smoke-test
+smoke-test.exe

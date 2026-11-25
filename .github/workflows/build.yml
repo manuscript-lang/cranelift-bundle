@@ -60,9 +60,9 @@ jobs:
       - name: Smoke test (load the library by path, compile a function, check the object)
         run: |
           case "${{ matrix.os }}" in
-            linux)   cc smoke/smoke.c -ldl -o smoke && ./smoke target/release/libms_cranelift.so ;;
-            darwin)  cc smoke/smoke.c -o smoke && ./smoke target/release/libms_cranelift.dylib ;;
-            windows) clang smoke/smoke.c -o smoke.exe && ./smoke.exe target/release/ms_cranelift.dll ;;
+            linux)   cc smoke/smoke.c -ldl -o smoke-test && ./smoke-test target/release/libms_cranelift.so ;;
+            darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib ;;
+            windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll ;;
           esac
       - run: cat dist-summary.txt
       - uses: actions/upload-artifact@v4
