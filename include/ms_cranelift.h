@@ -124,6 +124,11 @@ typedef struct { uint32_t offset, kind, target; int64_t addend; } ms_cl_reloc;
   X(void, ms_cl_store, (ms_cl_fn *f, uint32_t mem, ms_cl_val v, ms_cl_val base, int32_t off)) \
   /* A store of the low 8, 16 or 32 bits of an integer. */ \
   X(void, ms_cl_store_trunc, (ms_cl_fn *f, uint32_t bits, uint32_t mem, ms_cl_val v, ms_cl_val base, int32_t off)) \
+  /* Bulk memory. ms_cl_copy: a constant size, the ranges must not overlap; small sizes are loads and stores, larger \
+     ones a call of memcpy. ms_cl_copy_dyn: a size in a value, memmove. ms_cl_fill: a constant size set to a byte. */ \
+  X(void, ms_cl_copy, (ms_cl_fn *f, ms_cl_val dst, ms_cl_val src, uint32_t bytes)) \
+  X(void, ms_cl_copy_dyn, (ms_cl_fn *f, ms_cl_val dst, ms_cl_val src, ms_cl_val n)) \
+  X(void, ms_cl_fill, (ms_cl_fn *f, ms_cl_val dst, uint8_t byte, uint32_t bytes)) \
   X(ms_cl_val, ms_cl_atomic_load, (ms_cl_fn *f, ms_cl_type t, uint32_t mem, ms_cl_val addr)) \
   X(void, ms_cl_atomic_store, (ms_cl_fn *f, uint32_t mem, ms_cl_val v, ms_cl_val addr)) \
   /* Both return the old value. */ \
@@ -210,6 +215,9 @@ extern ms_cl_api ms_cl_fns;
 #define ms_cl_load_ext ms_cl_fns.fn_ms_cl_load_ext
 #define ms_cl_store ms_cl_fns.fn_ms_cl_store
 #define ms_cl_store_trunc ms_cl_fns.fn_ms_cl_store_trunc
+#define ms_cl_copy ms_cl_fns.fn_ms_cl_copy
+#define ms_cl_copy_dyn ms_cl_fns.fn_ms_cl_copy_dyn
+#define ms_cl_fill ms_cl_fns.fn_ms_cl_fill
 #define ms_cl_atomic_load ms_cl_fns.fn_ms_cl_atomic_load
 #define ms_cl_atomic_store ms_cl_fns.fn_ms_cl_atomic_store
 #define ms_cl_atomic_rmw ms_cl_fns.fn_ms_cl_atomic_rmw

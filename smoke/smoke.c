@@ -88,6 +88,7 @@ int main(int argc, char **argv) {
   ms_cl_func f_fl = ms_cl_declare_func(c, "ms_float", s_f, MS_CL_EXPORT);      /* min(1000, (i64)sqrt(a * a + 1)) */
   ms_cl_func f_mem = ms_cl_declare_func(c, "ms_mem", s_i, MS_CL_EXPORT);       /* slot, narrow stores and loads, data, atomic, switch, call */
   ms_cl_func f_ind = ms_cl_declare_func(c, "ms_indirect", s_ii, MS_CL_EXPORT); /* ms_add through a pointer held in data */
+  ms_cl_func f_bulk = ms_cl_declare_func(c, "ms_bulk", s_i, MS_CL_EXPORT);    /* bulk memory: fill, copy (small and large), move */
   for (int i = 0; i < WORKERS * PER_WORKER; i++) {
     char name[32];
     snprintf(name, sizeof name, "pf_%d", i);
@@ -191,6 +192,20 @@ int main(int argc, char **argv) {
   ms_cl_ret1(f, ms_cl_call_indirect1(f, s_ii, fp, (ms_cl_val[]){ms_cl_block_param(f, b, 0), ms_cl_block_param(f, b, 1)}, 2));
   ms_cl_seal_all(f);
   finish_fn(f, "ms_indirect");
+  ms_cl_fn_begin(f, f_bulk);
+  b = ms_cl_entry(f);
+  x = ms_cl_block_param(f, b, 0);
+  ms_cl_val from = ms_cl_stack_addr(f, ms_cl_stack_slot(f, 512, 3), 0);
+  ms_cl_val to = ms_cl_stack_addr(f, ms_cl_stack_slot(f, 512, 3), 0);
+  ms_cl_fill(f, from, 0, 512);                   /* large: a call of memset */
+  ms_cl_store(f, MS_CL_TRUSTED, x, from, 8);
+  ms_cl_store(f, MS_CL_TRUSTED, x, from, 300);
+  ms_cl_copy(f, to, from, 512);                  /* large: a call of memcpy */
+  ms_cl_copy(f, from, to, 16);                   /* small: loads and stores */
+  ms_cl_copy_dyn(f, to, from, ms_cl_i64const(f, 8)); /* memmove */
+  ms_cl_ret1(f, ms_cl_iadd(f, ms_cl_load(f, MS_CL_I64, MS_CL_TRUSTED, to, 8), ms_cl_load(f, MS_CL_I64, MS_CL_TRUSTED, to, 300)));
+  ms_cl_seal_all(f);
+  finish_fn(f, "ms_bulk");
   ms_cl_fn_free(f);
 
   for (int w = 0; w < WORKERS; w++) join(t[w]);

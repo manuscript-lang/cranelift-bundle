@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 extern int64_t ms_add(int64_t, int64_t), ms_sum(int64_t), ms_checked(int64_t, int64_t), ms_float(double),
-    ms_mem(int64_t), ms_indirect(int64_t, int64_t), pf_0(int64_t), pf_5(int64_t), pf_17(int64_t), pf_63(int64_t);
+    ms_mem(int64_t), ms_indirect(int64_t, int64_t), ms_bulk(int64_t), pf_0(int64_t), pf_5(int64_t), pf_17(int64_t), pf_63(int64_t);
 extern int64_t ms_counter;
 extern const uintptr_t ms_pcs[3];
 static int bad;
@@ -19,6 +19,7 @@ int main(void) {
   EXPECT(ms_mem(2), 255 + 2 - 1 + 10 + 1000);
   EXPECT(ms_counter, 15);
   EXPECT(ms_indirect(20, 22), 42);
+  EXPECT(ms_bulk(21), 42);
   EXPECT(pf_0(7), 7);
   EXPECT(pf_5(10), 15);
   EXPECT(pf_17(100), 117);

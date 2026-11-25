@@ -1081,6 +1081,47 @@ pub unsafe extern "C" fn ms_cl_store(f: *mut Fnb, flags: u32, v: Val, base: Val,
     bld(c).ins().store(mflags(flags), v, base, off);
 }
 
+/// Copies `bytes` bytes (a constant) from `src` to `dst`; the ranges must not overlap. Small sizes become loads and
+/// stores, larger ones a call of the C library's `memcpy`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_cl_copy(f: *mut Fnb, dst: Val, src: Val, bytes: u32) {
+    let c = fb(f);
+    let (dst, src) = (val(c, dst), val(c, src));
+    let cfg = c.isa.frontend_config();
+    let b = bld(c);
+    if bytes <= 128 {
+        b.emit_small_memory_copy(cfg, dst, src, bytes as u64, 1, 1, true, mflags(3));
+    } else {
+        let n = b.ins().iconst(ir::types::I64, bytes as i64);
+        b.call_memcpy(cfg, dst, src, n);
+    }
+}
+
+/// Copies `n` bytes (a value) from `src` to `dst`: the C library's `memmove`, so the ranges may overlap.
+#[no_mangle]
+pub unsafe extern "C" fn ms_cl_copy_dyn(f: *mut Fnb, dst: Val, src: Val, n: Val) {
+    let c = fb(f);
+    let (dst, src, n) = (val(c, dst), val(c, src), val(c, n));
+    let cfg = c.isa.frontend_config();
+    bld(c).call_memmove(cfg, dst, src, n);
+}
+
+/// Sets `bytes` bytes (a constant) at `dst` to `byte`.
+#[no_mangle]
+pub unsafe extern "C" fn ms_cl_fill(f: *mut Fnb, dst: Val, byte: u8, bytes: u32) {
+    let c = fb(f);
+    let dst = val(c, dst);
+    let cfg = c.isa.frontend_config();
+    let b = bld(c);
+    if bytes <= 128 {
+        b.emit_small_memset(cfg, dst, byte, bytes as u64, 1, mflags(3));
+    } else {
+        let ch = b.ins().iconst(ir::types::I8, byte as i64);
+        let n = b.ins().iconst(ir::types::I64, bytes as i64);
+        b.call_memset(cfg, dst, ch, n);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ms_cl_store_trunc(f: *mut Fnb, bits: u32, flags: u32, v: Val, base: Val, off: i32) {
     let c = fb(f);
