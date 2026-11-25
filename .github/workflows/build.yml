@@ -62,7 +62,7 @@ jobs:
           case "${{ matrix.os }}" in
             linux)   cc smoke/smoke.c -ldl -lpthread -o smoke-test && ./smoke-test target/release/libms_cranelift.so smoke.o
                      cc smoke/main.c smoke.o -o smoke-run && ./smoke-run
-                     readelf --debug-dump=decodedline smoke.o | grep -q 'smoke.ms *42' ;;
+                     readelf --debug-dump=decodedline smoke.o > lines.txt && grep -q 'smoke.ms *42' lines.txt ;;
             darwin)  cc smoke/smoke.c -o smoke-test && ./smoke-test target/release/libms_cranelift.dylib smoke.o
                      cc smoke/main.c smoke.o -o smoke-run && ./smoke-run ;;
             windows) clang smoke/smoke.c -o smoke-test.exe && ./smoke-test.exe target/release/ms_cranelift.dll smoke.obj
