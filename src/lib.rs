@@ -269,7 +269,15 @@ impl Drop for Cl {
 }
 
 fn compile_ctx(isa: &OwnedTargetIsa, ctx: &mut Context, id: FuncId, locs: &[(u32, u32, u32)]) -> Result<(Compiled, Vec<ClCodeRange>), String> {
-    ctx.compile(&**isa, &mut ControlPlane::default()).map_err(|e| format!("{e:?}"))?;
+    // A Cranelift bug panics; report it as this function's error so the caller can fall back instead of dying.
+    let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.compile(&**isa, &mut ControlPlane::default()).map(|_| ()).map_err(|e| format!("{e:?}"))));
+    match compiled {
+        Ok(result) => result?,
+        Err(payload) => {
+            let text = payload.downcast_ref::<String>().cloned().or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()));
+            return Err(format!("Cranelift panicked: {}", text.unwrap_or_default()));
+        }
+    };
     let cc = ctx.compiled_code().unwrap();
     let size = cc.code_buffer().len() as u32;
     let mut ranges = Vec::new();
