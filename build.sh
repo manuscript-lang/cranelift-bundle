@@ -8,7 +8,8 @@ case "$arch" in amd64) feat=x86 ;; arm64) feat=arm64 ;; *) echo "bad arch $arch"
 case "$os" in linux) lib=libms_cranelift.so ;; darwin) lib=libms_cranelift.dylib ;; windows) lib=ms_cranelift.dll ;; *) echo "bad os $os" >&2; exit 1 ;; esac
 cd "$(dirname "$0")"
 sh apply-patches.sh
-cargo build --release --locked --config 'patch.crates-io.cranelift-codegen.path="vendor/cranelift-codegen"' --no-default-features --features "$feat"
+# shellcheck disable=SC2046
+cargo build --release --locked $(sh patch-config.sh) --no-default-features --features "$feat"
 out=dist/stage/cranelift-lib
 rm -rf dist/stage && mkdir -p "$out/lib" "$out/include" dist
 if [ "$os" = windows ]; then mkdir -p "$out/bin"; cp "target/release/$lib" "$out/bin/"; else cp "target/release/$lib" "$out/lib/"; fi

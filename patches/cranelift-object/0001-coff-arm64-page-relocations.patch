@@ -1,0 +1,23 @@
+diff --git a/src/backend.rs b/src/backend.rs
+--- a/src/backend.rs
++++ b/src/backend.rs
+@@ -1007,6 +1007,9 @@
+                     r_pcrel: true,
+                     r_length: 2,
+                 },
++                object::BinaryFormat::Coff => RelocationFlags::Coff {
++                    typ: object::pe::IMAGE_REL_ARM64_PAGEBASE_REL21,
++                },
+                 _ => unimplemented!("Aarch64AdrPrelPgHi21 is not supported for this file format"),
+             },
+             Reloc::Aarch64AddAbsLo12Nc => match self.object.format() {
+@@ -1018,6 +1021,9 @@
+                     r_pcrel: false,
+                     r_length: 2,
+                 },
++                object::BinaryFormat::Coff => RelocationFlags::Coff {
++                    typ: object::pe::IMAGE_REL_ARM64_PAGEOFFSET_12A,
++                },
+                 _ => unimplemented!("Aarch64AddAbsLo12Nc is not supported for this file format"),
+             },
+             Reloc::S390xPCRel32Dbl => RelocationFlags::Generic {
