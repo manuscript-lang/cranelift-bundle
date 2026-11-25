@@ -6,7 +6,7 @@ A shared [Cranelift](https://cranelift.dev) code-generation library for [Manuscr
 
 ## Releases
 
-Create the release `cranelift-<version>-r<revision>` for a tag by hand; the build attaches, per `<os>-<arch>`:
+Push the tag `cranelift-<version>-r<revision>` (it must match `cranelift-version`); the build creates the release and attaches, per `<os>-<arch>`:
 
 | Asset | Contents |
 | --- | --- |

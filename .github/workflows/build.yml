@@ -2,7 +2,7 @@ name: Build
 
 # Builds the shared Cranelift library on a native runner of each of six platforms and smoke-tests it by loading it from C.
 # Pushing a tag `cranelift-<version>-r<revision>` that matches cranelift-version attaches the tarballs and a SHA256SUMS file
-# to the release of the same name, which must exist by then (created by hand). Pull requests and manual runs only build.
+# to the release of the same name (created if missing). Pull requests and manual runs only build.
 
 on:
   workflow_dispatch:
@@ -93,6 +93,6 @@ jobs:
         run: |
           version=$(tr -d '[:space:]' < cranelift-version)
           case "$TAG" in "cranelift-$version-r"*) ;; *) echo "tag $TAG does not match cranelift-version $version" >&2; exit 1 ;; esac
-          gh release view "$TAG" >/dev/null 2>&1 || { echo "create the release $TAG first; this job only attaches files" >&2; exit 1; }
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Cranelift $version shared library for Manuscript, one per platform. Verify downloads against checksums pinned in the consumer."
           cd assets && cat -- *.sha256 | sort -k2 > SHA256SUMS && cd ..
           gh release upload "$TAG" --clobber assets/*
